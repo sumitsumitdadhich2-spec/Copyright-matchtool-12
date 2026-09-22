@@ -2384,7 +2384,7 @@ class Scheduler {
       })
 
       if (!acquired) {
-        const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0, m.rpd || 20)
+        const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0, m.rpd || 20, 60)
         st.state = laneBusy.cooling ? 'cooling' : laneBusy.exhausted ? 'exhausted' : 'waiting'
         st.currentChunk = null
         if (laneBusy.exhausted) {
@@ -2392,7 +2392,7 @@ class Scheduler {
           this.mark(job)
           return
         }
-        await sleep(1000)
+        await sleep(laneBusy.cooling && laneBusy.waitSec ? Math.min(2000, laneBusy.waitSec * 1000) : 1000)
         continue
       }
 
@@ -2720,6 +2720,7 @@ class Scheduler {
             0,
             m.rpd || 20,
             e.kind === 'rpd',
+            lane.idx,
           )
           if (quotaOutcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey)

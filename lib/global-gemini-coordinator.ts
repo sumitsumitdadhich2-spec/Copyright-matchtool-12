@@ -51,6 +51,15 @@ class GlobalGeminiCoordinator {
   private lanes = new Map<string, GlobalLaneState>()
   private currentActiveDay = geminiUsageDay()
 
+  // Track active chunk mapping and chunk cooldown per (API key × Model):
+  // Because in Gemini API, rate limits (TPM, RPM, RPD) are enforced PER MODEL on each API key!
+  // E.g. gemini-3.7-flash has its own 250k TPM, gemini-3.8-flash has its own 250k TPM, gemini-3.6-flash has its own 250k TPM.
+  // One model running a chunk scan on Key 1 does NOT block or consume the TPM of a different model on Key 1.
+  // However, on the SAME (API key × Model), exactly ONE chunk mapping (~190,000 tokens) may execute at a time,
+  // and upon completion, that specific (API key × Model) enters the 70s TPM cooldown.
+  private modelChunkCooldownUntil = new Map<string, number>()
+  private modelActiveChunkScan = new Map<string, { scanId: string; modelId: string }>()
+
   /**
    * Checks if the date has rolled over (midnight Pacific Time).
    * Automatically clears all exhaustion flags across all lanes so the new day's quota is instantly active!
@@ -60,6 +69,8 @@ class GlobalGeminiCoordinator {
     if (today !== this.currentActiveDay) {
       console.log(`[Global Coordinator] Daily quota rollover detected (${this.currentActiveDay} -> ${today}). Resetting all lane exhaustion flags!`)
       this.currentActiveDay = today
+      this.modelActiveChunkScan.clear()
+      this.modelChunkCooldownUntil.clear()
       for (const lane of this.lanes.values()) {
         lane.isExhausted = false
         lane.cooldownUntil = 0
@@ -91,6 +102,10 @@ class GlobalGeminiCoordinator {
     return `${apiKeyHash(apiKey)}:${modelId}:${slot}`
   }
 
+  private getModelKey(apiKey: string, modelId: string): string {
+    return `${apiKeyHash(apiKey)}:${modelId}`
+  }
+
   private getOrCreateLane(apiKey: string, modelId: string, slot: number = 0, keyIdx: number = 1): GlobalLaneState {
     const key = this.getLaneKey(apiKey, modelId, slot)
     let lane = this.lanes.get(key)
@@ -120,7 +135,7 @@ class GlobalGeminiCoordinator {
   }
 
   /** Check if a lane is currently in use by ANY scan, in cooldown/pacing, or exhausted */
-  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 500): {
+  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 500, videoSeconds: number = 0): {
     busy: boolean
     exhausted?: boolean
     activeScanId?: string
@@ -139,6 +154,30 @@ class GlobalGeminiCoordinator {
         busy: true,
         exhausted: true,
         activeOperation: 'Exhausted for today',
+      }
+    }
+
+    // Heavy chunk mapping (videoSeconds >= 50, ~190,000 tokens):
+    // Strict per-model serialization: exactly 1 chunk scan per (API key × Model)!
+    // Other models on this same API key have their own independent TPM and are NOT blocked.
+    if (videoSeconds >= 50) {
+      const kmKey = this.getModelKey(apiKey, modelId)
+      const activeChunk = this.modelActiveChunkScan.get(kmKey)
+      if (activeChunk) {
+        return {
+          busy: true,
+          activeScanId: activeChunk.scanId,
+          activeOperation: `Chunk scan on ${activeChunk.modelId}`,
+        }
+      }
+
+      const modelCool = this.modelChunkCooldownUntil.get(kmKey) || 0
+      if (modelCool > now) {
+        return {
+          busy: true,
+          cooling: true,
+          waitSec: Math.ceil((modelCool - now) / 1000),
+        }
       }
     }
 
@@ -207,11 +246,28 @@ class GlobalGeminiCoordinator {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
     const now = Date.now()
+    const kmKey = this.getModelKey(apiKey, modelId)
 
     // 1. Quota check
     if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpd)) {
       lane.isExhausted = true
       return null
+    }
+
+    // Heavy chunk mapping (videoSeconds >= 50):
+    // Exactly ONE chunk request (~190,000 tokens) may execute per (API key × Model) at any time,
+    // and must observe the 70s cooldown before the next chunk request on that model.
+    // Other models on this API key have their own independent TPM and remain completely free.
+    if (videoSeconds >= 50) {
+      const activeChunk = this.modelActiveChunkScan.get(kmKey)
+      if (activeChunk) {
+        return null // This model on this API key is already running a chunk scan!
+      }
+
+      const modelCool = this.modelChunkCooldownUntil.get(kmKey) || 0
+      if (modelCool > now) {
+        return null // This model on this API key is still in 70s TPM cooldown
+      }
     }
 
     // 2. Concurrency check: already in use by any scan?
@@ -234,6 +290,10 @@ class GlobalGeminiCoordinator {
     lane.activeScanTitle = scanTitle
     lane.activeOperation = operation
     lane.activeSince = now
+
+    if (videoSeconds >= 50) {
+      this.modelActiveChunkScan.set(kmKey, { scanId, modelId })
+    }
 
     const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
       this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
@@ -261,6 +321,8 @@ class GlobalGeminiCoordinator {
    * Called when user manually resets daily counters via Settings.
    */
   public resetAllLanes(): void {
+    this.modelActiveChunkScan.clear()
+    this.modelChunkCooldownUntil.clear()
     for (const lane of this.lanes.values()) {
       lane.isExhausted = false
       lane.cooldownUntil = 0
@@ -485,6 +547,12 @@ class GlobalGeminiCoordinator {
 
       // 2. Check for immediately FREE lanes (no active scan, no cooldown, no pacing wait, no waiters)
       for (const cand of sortedCandidates) {
+        const kmKey = this.getModelKey(cand.apiKey, cand.modelId)
+        if (videoSeconds >= 50) {
+          if (this.modelActiveChunkScan.has(kmKey)) continue
+          if ((this.modelChunkCooldownUntil.get(kmKey) || 0) > now) continue
+        }
+
         const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
         const isFree =
           lane.activeScanId === null &&
@@ -498,6 +566,10 @@ class GlobalGeminiCoordinator {
           lane.activeScanTitle = scanTitle
           lane.activeOperation = operation
           lane.activeSince = Date.now()
+
+          if (videoSeconds >= 50) {
+            this.modelActiveChunkScan.set(kmKey, { scanId, modelId: cand.modelId })
+          }
 
           const release = (actualVideoSec?: number) => {
             this.releaseLane(lane, actualVideoSec ?? videoSeconds)
@@ -543,6 +615,7 @@ class GlobalGeminiCoordinator {
       ? cooldownOverrideMs
       : (videoSeconds >= 50 ? CHUNK_COOLDOWN_MS : pacingIntervalMs(videoSeconds))
     const now = Date.now()
+    const kh = lane.keyHash
     lane.lastCompletedAt = now
     lane.nextFreeAt = now + paceMs
     lane.cooldownUntil = Math.max(lane.cooldownUntil, now + paceMs)
@@ -554,9 +627,14 @@ class GlobalGeminiCoordinator {
     lane.activeSince = null
 
     // For chunk mappings (videoSeconds >= 50 or paceMs >= 50000), synchronize cooldown across ALL slots of this (key × model)
-    // so no other slot or parallel scan can trigger a TPM/RPM collision during the cooldown window.
+    // and release model-level active chunk mapping so that the 70s TPM cooldown is strictly observed for this model.
+    // Other models on the same key have their own independent TPM and are completely unaffected.
+    const kmKey = `${kh}:${lane.modelId}`
     if (paceMs >= 50000 || videoSeconds >= 50) {
-      const kh = lane.keyHash
+      this.modelActiveChunkScan.delete(kmKey)
+      if (paceMs > 0) {
+        this.modelChunkCooldownUntil.set(kmKey, now + paceMs)
+      }
       for (const other of this.lanes.values()) {
         if (other.keyHash === kh && other.modelId === lane.modelId) {
           other.cooldownUntil = Math.max(other.cooldownUntil, now + paceMs)
@@ -624,7 +702,7 @@ class GlobalGeminiCoordinator {
   /** Record successful request on this lane — resets consecutive error counters */
   public recordSuccess(apiKey: string, modelId: string, slot: number = 0) {
     const kh = apiKeyHash(apiKey)
-    const specificLane = this.lanes.get(getLaneKey(apiKey, modelId, slot))
+    const specificLane = this.lanes.get(this.getLaneKey(apiKey, modelId, slot))
     if (specificLane) specificLane.consecutiveQuotaErrors = 0
     for (const lane of this.lanes.values()) {
       if (lane.keyHash === kh && lane.modelId === modelId) {
@@ -663,14 +741,23 @@ class GlobalGeminiCoordinator {
     slot: number = 0,
     rpdCap: number = 20,
     isExplicitDailyMsg: boolean = false,
+    keyIdx: number = 1,
   ): {
     action: 'cooldown' | 'exhausted'
     waitSec: number
     reason: string
   } {
     this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
+    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
+    if (keyIdx > 0) lane.keyIdx = keyIdx
     const used = getModelUsage(modelId, apiKey)
+    const kh = apiKeyHash(apiKey)
+    const kmKey = `${kh}:${modelId}`
+
+    // Clear active chunk mapping on this (key × model) and enforce 70s model-level cooldown.
+    // Other models on this same API key have their own independent TPM and proceed uninterrupted!
+    this.modelActiveChunkScan.delete(kmKey)
+    this.modelChunkCooldownUntil.set(kmKey, Date.now() + CHUNK_COOLDOWN_MS)
 
     // True daily quota exhaustion ONLY if:
     // 1. Recorded usage has reached or passed the daily cap (used >= rpdCap), OR
