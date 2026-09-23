@@ -2781,7 +2781,7 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'exhausted'
             }
-            addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
+            addLog(scan, 'error', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
           } else {
             job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + (quotaOutcome.waitSec * 1000 || CHUNK_COOLDOWN_MS)
             const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
@@ -2789,7 +2789,7 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'cooling'
             }
-            addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
+            addLog(scan, 'error', `[Gemini TPM Hit] ${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

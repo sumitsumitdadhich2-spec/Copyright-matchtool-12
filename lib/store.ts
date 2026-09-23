@@ -176,17 +176,9 @@ export function getModelUsage(model: string, apiKey: string): number {
 
 export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
   checkDailyReset()
-  const counters = getCachedCounters()
   const usage = getModelUsage(model, apiKey)
-  if (counters[exhaustedKey(model, apiKey)] === true) {
-    // Verify against actual genuine requests today. If usage is under cap, do not trust spurious flag!
-    if (usage < rpdCap) {
-      delete counters[exhaustedKey(model, apiKey)]
-      saveCounters(counters)
-      return false
-    }
-    return true
-  }
+  // Quota shown in Settings is the absolute final source of truth:
+  // If usage is below cap, quota is available. If usage >= cap, it is exhausted.
   return usage >= rpdCap
 }
 

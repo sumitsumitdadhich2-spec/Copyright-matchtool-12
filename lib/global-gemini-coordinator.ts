@@ -188,8 +188,9 @@ class GlobalGeminiCoordinator {
     const gate = this.getOrCreateChunkGate(apiKey, modelId, keyIdx)
     const now = Date.now()
 
-    if (gate.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
-      gate.isExhausted = true
+    const exhausted = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    gate.isExhausted = exhausted
+    if (exhausted) {
       return { available: false, busy: true, exhausted: true }
     }
 
@@ -423,8 +424,9 @@ class GlobalGeminiCoordinator {
     const gate = this.getOrCreateVerifierGate(apiKey, modelId, keyIdx)
     const now = Date.now()
 
-    if (gate.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
-      gate.isExhausted = true
+    const exhausted = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    gate.isExhausted = exhausted
+    if (exhausted) {
       return { available: false, busy: true, exhausted: true }
     }
 
@@ -904,10 +906,9 @@ class GlobalGeminiCoordinator {
     const used = getModelUsage(modelId, apiKey)
     const kmKey = this.getModelKey(apiKey, modelId)
 
-    // ONLY mark permanently exhausted if actual usage genuinely reached rpdCap,
-    // or explicit daily request limit arrived AND usage is near cap (>= rpdCap - 1).
-    // Never mark exhausted at 1/20, 2/20, or 4/20 due to temporary token burst limits!
-    if (used >= rpdCap || (isExplicitDailyMsg && used >= Math.max(1, rpdCap - 1))) {
+    // Quota in Settings is the absolute final source of truth:
+    // If used < rpdCap, quota is NOT exhausted! Treat any 429/Resource Exhausted as a temporary TPM rate limit.
+    if (used >= rpdCap) {
       this.reportExhausted(apiKey, modelId, slot, rpdCap)
       return {
         action: 'exhausted',
@@ -930,7 +931,7 @@ class GlobalGeminiCoordinator {
     return {
       action: 'cooldown',
       waitSec,
-      reason: `Temporary TPM rate limit on ${modelId} (Key ${keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for ${waitSec}s`,
+      reason: `TPM rate limit hit on ${modelId} (Key ${keyIdx}, used ${used}/${rpdCap} RPD — quota remaining: ${rpdCap - used}) — waiting ${waitSec}s before retry`,
     }
   }
 
