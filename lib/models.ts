@@ -19,13 +19,12 @@ export const CHUNK_MODEL_POOL: ModelSpec[] = [
   { id: 'gemini-3.8-flash', rpm: 5, rpd: 20 },
 ]
 
-/** VERIFY models (locked): gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY.
- * Dono ki daily limit 500 RPD each hai — har model ek sath 3 parallel requests handle kar sakta hai.
- * 1 key par 2 models × 3 requests = 6 parallel requests. 5 keys par = 30 parallel requests.
- * Clips <= 4s hone ki wajah se TPM 250K cap ke andar safe rehta hai. */
+/** VERIFY models (locked): gemini-3.1-flash-lite + gemini-3.5-flash-lite.
+ * Dono ki daily limit 500 RPD each hai. gemini-3.1-flash-lite is prioritized first
+ * as it delivers ultra-stable 0% error rate under heavy parallel load. */
 export const VERIFY_MODEL_POOL: ModelSpec[] = [
-  { id: 'gemini-3.5-flash-lite', rpm: 15, rpd: 500 },
   { id: 'gemini-3.1-flash-lite', rpm: 15, rpd: 500 },
+  { id: 'gemini-3.5-flash-lite', rpm: 15, rpd: 500 },
 ]
 
 /** RESCAN models (primary): gemini-3-flash-preview and gemini-3.5-flash run
@@ -40,8 +39,8 @@ export const RESCAN_MODEL_POOL: ModelSpec[] = [
  * ki daily limit khatam ho jaye, to rescan in HIGH-LIMIT lite models par
  * fallback karta hai (500 RPD each) — rescan kabhi ruke nahi. */
 export const RESCAN_BACKUP_POOL: ModelSpec[] = [
-  { id: 'gemini-3.5-flash-lite', rpm: 15, rpd: 500 },
   { id: 'gemini-3.1-flash-lite', rpm: 15, rpd: 500 },
+  { id: 'gemini-3.5-flash-lite', rpm: 15, rpd: 500 },
 ]
 
 export interface GapFinderModelOption {

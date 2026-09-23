@@ -327,6 +327,7 @@ export interface CandidateEntry {
   /** verifier verdict for the rescan-found window */
   rescanVerdict?: CandidateVerdict
   rescanReason?: string
+  rescanModel?: string
 }
 
 export type CandidateGroupStatus =

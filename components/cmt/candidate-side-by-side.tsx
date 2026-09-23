@@ -49,6 +49,8 @@ export function CandidateSideBySide({
   const shortBarRef = useRef<HTMLDivElement>(null)
   const movieBarRef = useRef<HTMLDivElement>(null)
   const animFrameRef = useRef<number | null>(null)
+  const shortLockedRef = useRef(false)
+  const movieLockedRef = useRef(false)
 
   const [playing, setPlaying] = useState(false)
   const [loop, setLoop] = useState(true)
@@ -79,6 +81,8 @@ export function CandidateSideBySide({
   // Seek both videos to the candidate segment start when candidate changes
   useEffect(() => {
     setPlaying(false)
+    shortLockedRef.current = false
+    movieLockedRef.current = false
     if (shortRef.current) {
       shortRef.current.pause()
       safeSeek(shortRef.current, shortStart)
@@ -105,25 +109,60 @@ export function CandidateSideBySide({
     const tick = () => {
       if (!sEl || !mEl) return
 
-      const sCur = sEl.currentTime
-      const mCur = mEl.currentTime
+      let sDone = shortLockedRef.current
+      let mDone = movieLockedRef.current
 
-      const sProg = Math.max(0, Math.min(1, (sCur - shortStart) / shortDuration))
-      const mProg = Math.max(0, Math.min(1, (mCur - movieStart) / movieDuration))
+      // Short video progress & hard stop
+      if (!sDone) {
+        const sCur = sEl.currentTime
+        const sProg = Math.max(0, Math.min(1, (sCur - shortStart) / shortDuration))
+        if (shortBarRef.current) {
+          shortBarRef.current.style.width = `${sProg * 100}%`
+        }
 
-      if (shortBarRef.current) {
-        shortBarRef.current.style.width = `${sProg * 100}%`
+        if (sCur >= shortEnd - 0.02) {
+          sEl.pause()
+          sEl.currentTime = shortEnd
+          if (shortBarRef.current) shortBarRef.current.style.width = '100%'
+          shortLockedRef.current = true
+          sDone = true
+        }
+      } else {
+        if (!sEl.paused) sEl.pause()
+        if (Math.abs(sEl.currentTime - shortEnd) > 0.04) {
+          sEl.currentTime = shortEnd
+        }
+        if (shortBarRef.current) shortBarRef.current.style.width = '100%'
       }
-      if (movieBarRef.current) {
-        movieBarRef.current.style.width = `${mProg * 100}%`
+
+      // Movie video progress & hard stop
+      if (!mDone) {
+        const mCur = mEl.currentTime
+        const mProg = Math.max(0, Math.min(1, (mCur - movieStart) / movieDuration))
+        if (movieBarRef.current) {
+          movieBarRef.current.style.width = `${mProg * 100}%`
+        }
+
+        if (mCur >= movieEnd - 0.02) {
+          mEl.pause()
+          mEl.currentTime = movieEnd
+          if (movieBarRef.current) movieBarRef.current.style.width = '100%'
+          movieLockedRef.current = true
+          mDone = true
+        }
+      } else {
+        if (!mEl.paused) mEl.pause()
+        if (Math.abs(mEl.currentTime - movieEnd) > 0.04) {
+          mEl.currentTime = movieEnd
+        }
+        if (movieBarRef.current) movieBarRef.current.style.width = '100%'
       }
 
-      // Check if segment ended
-      const sDone = sCur >= shortEnd - 0.04
-      const mDone = mCur >= movieEnd - 0.04
-
-      if (sDone || mDone) {
+      // Both videos reached their respective hard ends
+      if (sDone && mDone) {
         if (loop) {
+          shortLockedRef.current = false
+          movieLockedRef.current = false
           safeSeek(sEl, shortStart)
           safeSeek(mEl, movieStart)
           void sEl.play().catch(() => {})
@@ -133,6 +172,7 @@ export function CandidateSideBySide({
           mEl.pause()
           setPlaying(false)
         }
+        return
       }
 
       animFrameRef.current = requestAnimationFrame(tick)
@@ -159,11 +199,13 @@ export function CandidateSideBySide({
       mEl.pause()
       setPlaying(false)
     } else {
+      shortLockedRef.current = false
+      movieLockedRef.current = false
       // If at end, seek to start before playing
-      if (sEl.currentTime >= shortEnd - 0.05 || sEl.currentTime < shortStart) {
+      if (sEl.currentTime >= shortEnd - 0.04 || sEl.currentTime < shortStart) {
         safeSeek(sEl, shortStart)
       }
-      if (mEl.currentTime >= movieEnd - 0.05 || mEl.currentTime < movieStart) {
+      if (mEl.currentTime >= movieEnd - 0.04 || mEl.currentTime < movieStart) {
         safeSeek(mEl, movieStart)
       }
       void sEl.play().catch(() => {})
@@ -176,6 +218,9 @@ export function CandidateSideBySide({
     const sEl = shortRef.current
     const mEl = movieRef.current
     if (!sEl || !mEl) return
+
+    shortLockedRef.current = false
+    movieLockedRef.current = false
 
     safeSeek(sEl, shortStart)
     safeSeek(mEl, movieStart)

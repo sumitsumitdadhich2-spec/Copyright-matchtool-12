@@ -8,7 +8,7 @@ import {
   geminiUsageDay,
   checkDailyReset,
 } from './store'
-import { pacingIntervalMs, RATE_COOLDOWN_MS, CHUNK_COOLDOWN_MS, displayModelName } from './models'
+import { RATE_COOLDOWN_MS, CHUNK_COOLDOWN_MS } from './models'
 
 export interface CandidateLane {
   apiKey: string
@@ -18,62 +18,74 @@ export interface CandidateLane {
   rpd?: number
 }
 
-interface LaneWaiter {
+interface Waiter<TRelease = (cooldownOverrideMs?: number) => void> {
+  id: string
   scanId: string
   scanTitle: string
   operation: string
-  resolve: (releaseFn: (actualVideoSec?: number, cooldownOverrideMs?: number) => void) => void
+  resolve: (releaseFn: TRelease) => void
   reject: (err: Error) => void
   isStopping?: () => boolean
 }
 
-interface GlobalLaneState {
-  laneKey: string
+/** State for Heavy Requests: Chunks & Rescans (~190,000 tokens) */
+interface ChunkGateState {
+  kmKey: string
   keyHash: string
   keyIdx: number
   modelId: string
-  slot: number
   activeScanId: string | null
   activeScanTitle: string | null
   activeOperation: string | null
   activeSince: number | null
-  lastCompletedAt?: number | null
-  lastOperation: string | null
-  lastOperationVideoSec: number | null
-  nextFreeAt: number
   cooldownUntil: number
-  consecutiveQuotaErrors?: number
   isExhausted: boolean
-  waiters: LaneWaiter[]
+  waiters: Waiter<(actualVideoSec?: number, cooldownOverrideMs?: number) => void>[]
+  dispatchTimer: NodeJS.Timeout | null
+}
+
+/** State for Light Requests: Candidate Verifications (~5,000–15,000 tokens, 2–4s clips) */
+interface VerifierGateState {
+  kmKey: string
+  keyHash: string
+  keyIdx: number
+  modelId: string
+  activeScanId: string | null
+  activeScanTitle: string | null
+  activeOperation: string | null
+  activeSince: number | null
+  cooldownUntil: number
+  nextFreeAt: number
+  isExhausted: boolean
+  waiters: Waiter<(actualVideoSec?: number, cooldownOverrideMs?: number) => void>[]
+  dispatchTimer: NodeJS.Timeout | null
 }
 
 class GlobalGeminiCoordinator {
-  private lanes = new Map<string, GlobalLaneState>()
   private currentActiveDay = geminiUsageDay()
 
-  // Track active chunk mapping and chunk cooldown per (API key × Model):
-  // Because in Gemini API, rate limits (TPM, RPM, RPD) are enforced PER MODEL on each API key!
-  // E.g. gemini-3.7-flash has its own 250k TPM, gemini-3.8-flash has its own 250k TPM, gemini-3.6-flash has its own 250k TPM.
-  // One model running a chunk scan on Key 1 does NOT block or consume the TPM of a different model on Key 1.
-  // However, on the SAME (API key × Model), exactly ONE chunk mapping (~190,000 tokens) may execute at a time,
-  // and upon completion, that specific (API key × Model) enters the 70s TPM cooldown.
-  private modelChunkCooldownUntil = new Map<string, number>()
-  private modelActiveChunkScan = new Map<string, { scanId: string; modelId: string }>()
+  // DEDICATED INDEPENDENT GATES (Per API Key × Model):
+  // 1. chunkGates: Chunks & Rescans (~190,000 tokens) - 70s TPM cooldown, max 1 active per (key × model).
+  // 2. verifierGates: Candidate Verifiers (~5,000–15,000 tokens) - 3s pacing, 60s cooldown on 429, max 1 active per (key × model).
+  private chunkGates = new Map<string, ChunkGateState>()
+  private verifierGates = new Map<string, VerifierGateState>()
 
-  /**
-   * Checks if the date has rolled over (midnight Pacific Time).
-   * Automatically clears all exhaustion flags across all lanes so the new day's quota is instantly active!
-   */
+  // Consecutive error counter per (key × model)
+  private consecutiveErrors = new Map<string, number>()
+
   public checkDayRollover(): boolean {
     const today = geminiUsageDay()
     if (today !== this.currentActiveDay) {
-      console.log(`[Global Coordinator] Daily quota rollover detected (${this.currentActiveDay} -> ${today}). Resetting all lane exhaustion flags!`)
+      console.log(`[Global Coordinator] Daily quota rollover detected (${this.currentActiveDay} -> ${today}). Resetting all gates!`)
       this.currentActiveDay = today
-      this.modelActiveChunkScan.clear()
-      this.modelChunkCooldownUntil.clear()
-      for (const lane of this.lanes.values()) {
-        lane.isExhausted = false
-        lane.cooldownUntil = 0
+      for (const cg of this.chunkGates.values()) {
+        cg.isExhausted = false
+        cg.cooldownUntil = 0
+      }
+      for (const vg of this.verifierGates.values()) {
+        vg.isExhausted = false
+        vg.cooldownUntil = 0
+        vg.nextFreeAt = 0
       }
       checkDailyReset()
       return true
@@ -81,61 +93,553 @@ class GlobalGeminiCoordinator {
     return false
   }
 
-  /**
-   * Instant, zero-wait quota check:
-   * Verifies if a model on a given API key has exhausted its daily quota (RPD)
-   * using coordinator in-memory lane state and cached counters.json.
-   */
-  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
-    this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, 0)
-    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
-    if (!exhaustedInStore) {
-      lane.isExhausted = false
-      return false
-    }
-    lane.isExhausted = true
-    return true
-  }
-
-  private getLaneKey(apiKey: string, modelId: string, slot: number = 0): string {
-    return `${apiKeyHash(apiKey)}:${modelId}:${slot}`
-  }
-
   private getModelKey(apiKey: string, modelId: string): string {
     return `${apiKeyHash(apiKey)}:${modelId}`
   }
 
-  private getOrCreateLane(apiKey: string, modelId: string, slot: number = 0, keyIdx: number = 1): GlobalLaneState {
-    const key = this.getLaneKey(apiKey, modelId, slot)
-    let lane = this.lanes.get(key)
-    if (!lane) {
-      lane = {
-        laneKey: key,
+  private getOrCreateChunkGate(apiKey: string, modelId: string, keyIdx: number = 1): ChunkGateState {
+    const kmKey = this.getModelKey(apiKey, modelId)
+    let gate = this.chunkGates.get(kmKey)
+    if (!gate) {
+      gate = {
+        kmKey,
         keyHash: apiKeyHash(apiKey),
         keyIdx,
         modelId,
-        slot,
         activeScanId: null,
         activeScanTitle: null,
         activeOperation: null,
         activeSince: null,
-        lastCompletedAt: null,
-        lastOperation: null,
-        lastOperationVideoSec: null,
-        nextFreeAt: 0,
         cooldownUntil: 0,
         isExhausted: false,
         waiters: [],
+        dispatchTimer: null,
       }
-      this.lanes.set(key, lane)
+      this.chunkGates.set(kmKey, gate)
     }
-    if (keyIdx > 0) lane.keyIdx = keyIdx
-    return lane
+    if (keyIdx > 0) gate.keyIdx = keyIdx
+    return gate
   }
 
-  /** Check if a lane is currently in use by ANY scan, in cooldown/pacing, or exhausted */
-  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 500, videoSeconds: number = 0): {
+  private getOrCreateVerifierGate(apiKey: string, modelId: string, keyIdx: number = 1): VerifierGateState {
+    const kmKey = this.getModelKey(apiKey, modelId)
+    let gate = this.verifierGates.get(kmKey)
+    if (!gate) {
+      gate = {
+        kmKey,
+        keyHash: apiKeyHash(apiKey),
+        keyIdx,
+        modelId,
+        activeScanId: null,
+        activeScanTitle: null,
+        activeOperation: null,
+        activeSince: null,
+        cooldownUntil: 0,
+        nextFreeAt: 0,
+        isExhausted: false,
+        waiters: [],
+        dispatchTimer: null,
+      }
+      this.verifierGates.set(kmKey, gate)
+    }
+    if (keyIdx > 0) gate.keyIdx = keyIdx
+    return gate
+  }
+
+  /**
+   * Instant, zero-wait quota check:
+   * Verifies if a model on a given API key has exhausted its daily quota (RPD).
+   */
+  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
+    this.checkDayRollover()
+    const kmKey = this.getModelKey(apiKey, modelId)
+    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    const cg = this.chunkGates.get(kmKey)
+    const vg = this.verifierGates.get(kmKey)
+    if (cg) cg.isExhausted = exhaustedInStore
+    if (vg) vg.isExhausted = exhaustedInStore
+    return exhaustedInStore
+  }
+
+  // =========================================================================
+  // GATE 1: CHUNK & RESCAN COORDINATOR (Heavy Requests: ~190,000 tokens)
+  // =========================================================================
+
+  /**
+   * Check before sending a Chunk / Rescan request:
+   * Checks if ANY scan is currently running a heavy request on this (key × model),
+   * if it is in 70s TPM cooldown, or if it is daily exhausted.
+   */
+  public canAcquireChunk(
+    apiKey: string,
+    modelId: string,
+    rpdCap: number = 20,
+    keyIdx: number = 1,
+  ): {
+    available: boolean
+    busy: boolean
+    exhausted?: boolean
+    cooling?: boolean
+    waitSec?: number
+    activeScanId?: string
+    activeOperation?: string
+  } {
+    this.checkDayRollover()
+    const gate = this.getOrCreateChunkGate(apiKey, modelId, keyIdx)
+    const now = Date.now()
+
+    if (gate.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+      gate.isExhausted = true
+      return { available: false, busy: true, exhausted: true }
+    }
+
+    if (gate.activeScanId !== null) {
+      return {
+        available: false,
+        busy: true,
+        activeScanId: gate.activeScanId,
+        activeOperation: gate.activeOperation || 'Chunk mapping',
+      }
+    }
+
+    if (gate.cooldownUntil > now) {
+      return {
+        available: false,
+        busy: true,
+        cooling: true,
+        waitSec: Math.ceil((gate.cooldownUntil - now) / 1000),
+      }
+    }
+
+    if (gate.waiters.length > 0) {
+      return {
+        available: false,
+        busy: true,
+        waitSec: 2,
+      }
+    }
+
+    return { available: true, busy: false }
+  }
+
+  /**
+   * Atomic Non-blocking Acquisition for Chunk scanning:
+   * If free, locks the model immediately and returns release. If busy/cooling, returns null.
+   */
+  public tryAcquireChunk(opts: {
+    scanId: string
+    scanTitle?: string
+    apiKey: string
+    keyIdx?: number
+    modelId: string
+    operation: string
+    rpd?: number
+  }): { release: (actualVideoSec?: number, cooldownOverrideMs?: number) => void } | null {
+    const { scanId, scanTitle = scanId, apiKey, keyIdx = 1, modelId, operation, rpd = 20 } = opts
+    const check = this.canAcquireChunk(apiKey, modelId, rpd, keyIdx)
+    if (!check.available) return null
+
+    const gate = this.getOrCreateChunkGate(apiKey, modelId, keyIdx)
+    gate.activeScanId = scanId
+    gate.activeScanTitle = scanTitle
+    gate.activeOperation = operation
+    gate.activeSince = Date.now()
+
+    const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+      this.releaseChunk(gate, actualVideoSec ?? 60, cooldownOverrideMs)
+    }
+
+    return { release }
+  }
+
+  /**
+   * Acquire lock for Chunk / Rescan with Anti-Thundering-Herd FIFO queue.
+   */
+  public async acquireChunk(opts: {
+    scanId: string
+    scanTitle?: string
+    apiKey: string
+    keyIdx?: number
+    modelId: string
+    operation: string
+    videoSeconds?: number
+    rpd?: number
+    onWait?: (msg: string, waitSec: number) => void
+    isStopping?: () => boolean
+  }): Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void> {
+    const {
+      scanId,
+      scanTitle = scanId,
+      apiKey,
+      keyIdx = 1,
+      modelId,
+      operation,
+      videoSeconds = 60,
+      rpd = 20,
+      onWait,
+      isStopping,
+    } = opts
+
+    this.checkDayRollover()
+    const gate = this.getOrCreateChunkGate(apiKey, modelId, keyIdx)
+
+    return new Promise((resolve, reject) => {
+      const now = Date.now()
+      const isFree =
+        !gate.isExhausted &&
+        !isModelDailyQuotaExhausted(modelId, apiKey, rpd) &&
+        gate.activeScanId === null &&
+        gate.cooldownUntil <= now &&
+        gate.waiters.length === 0
+
+      if (isFree) {
+        // Grab lock atomically
+        gate.activeScanId = scanId
+        gate.activeScanTitle = scanTitle
+        gate.activeOperation = operation
+        gate.activeSince = now
+
+        const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+          this.releaseChunk(gate, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
+        }
+        resolve(release)
+        return
+      }
+
+      // Model is currently busy or cooling down:
+      const waitSec = gate.cooldownUntil > now ? Math.ceil((gate.cooldownUntil - now) / 1000) : 5
+      const waitMsg = gate.activeScanId
+        ? `[Global Coordinator] Key ${gate.keyIdx} · ${modelId} is busy in Scan "${gate.activeScanTitle || gate.activeScanId}". Queued behind active scan...`
+        : `[Global Coordinator] Key ${gate.keyIdx} · ${modelId} in 70s TPM cooldown (${waitSec}s remaining). Queued...`
+      onWait?.(waitMsg, waitSec)
+
+      // Add to FIFO queue
+      gate.waiters.push({
+        id: Math.random().toString(36).substring(2, 9),
+        scanId,
+        scanTitle,
+        operation,
+        resolve,
+        reject,
+        isStopping,
+      })
+
+      // Ensure anti-thundering-herd dispatcher is scheduled
+      const delayMs = Math.max(1000, gate.cooldownUntil > now ? gate.cooldownUntil - now + 50 : 2000)
+      this.scheduleChunkDispatch(gate, delayMs)
+    })
+  }
+
+  private scheduleChunkDispatch(gate: ChunkGateState, delayMs: number) {
+    if (gate.dispatchTimer) {
+      clearTimeout(gate.dispatchTimer)
+      gate.dispatchTimer = null
+    }
+    gate.dispatchTimer = setTimeout(() => {
+      gate.dispatchTimer = null
+      this.dispatchNextChunk(gate)
+    }, Math.max(10, delayMs))
+  }
+
+  /**
+   * ANTI-THUNDERING-HERD DISPATCHER (Chunks & Rescans):
+   * When cooldown ends, pops and grants the lock to ONLY THE FIRST WAITER.
+   * Other parallel scans stay queued so they never hit Google at the same millisecond!
+   */
+  private dispatchNextChunk(gate: ChunkGateState) {
+    const now = Date.now()
+    if (gate.activeScanId !== null) return
+
+    if (gate.cooldownUntil > now) {
+      this.scheduleChunkDispatch(gate, gate.cooldownUntil - now + 50)
+      return
+    }
+
+    while (gate.waiters.length > 0) {
+      const next = gate.waiters.shift()!
+      if (next.isStopping && next.isStopping()) {
+        next.reject(new Error('Stop requested while queued in chunk coordinator'))
+        continue
+      }
+
+      // ATOMIC LOCK ACQUISITION:
+      // Mark as active immediately BEFORE resolving next!
+      // This guarantees no other scan or waiter can sneak in at the exact same millisecond.
+      gate.activeScanId = next.scanId
+      gate.activeScanTitle = next.scanTitle
+      gate.activeOperation = next.operation
+      gate.activeSince = Date.now()
+
+      const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+        this.releaseChunk(gate, actualVideoSec ?? 60, cooldownOverrideMs)
+      }
+
+      next.resolve(releaseFn)
+      return // ONLY ONE WAITER RESOLVED!
+    }
+  }
+
+  private releaseChunk(gate: ChunkGateState, videoSeconds: number, cooldownOverrideMs?: number) {
+    const now = Date.now()
+    gate.activeScanId = null
+    gate.activeScanTitle = null
+    gate.activeOperation = null
+    gate.activeSince = null
+
+    // 70s TPM Cooldown for heavy requests (~190,000 tokens)
+    const coolMs = cooldownOverrideMs !== undefined ? cooldownOverrideMs : CHUNK_COOLDOWN_MS
+    if (coolMs > 0) {
+      gate.cooldownUntil = Math.max(gate.cooldownUntil, now + coolMs)
+      this.scheduleChunkDispatch(gate, coolMs + 50)
+    } else if (gate.waiters.length > 0) {
+      this.scheduleChunkDispatch(gate, 50)
+    }
+  }
+
+  // =========================================================================
+  // GATE 2: VERIFIER COORDINATOR (Light Requests: ~5,000–15,000 tokens, 2–4s clips)
+  // =========================================================================
+
+  /**
+   * Check before sending a Verifier request:
+   * Checks if ANY scan is currently running a verifier request on this (key × model),
+   * if it is in verifier cooldown (429), or if it is currently in the 3s pacing delay.
+   */
+  public canAcquireVerifier(
+    apiKey: string,
+    modelId: string,
+    rpdCap: number = 500,
+    keyIdx: number = 1,
+  ): {
+    available: boolean
+    busy: boolean
+    exhausted?: boolean
+    cooling?: boolean
+    waitSec?: number
+    activeScanId?: string
+    activeOperation?: string
+  } {
+    this.checkDayRollover()
+    const gate = this.getOrCreateVerifierGate(apiKey, modelId, keyIdx)
+    const now = Date.now()
+
+    if (gate.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+      gate.isExhausted = true
+      return { available: false, busy: true, exhausted: true }
+    }
+
+    if (gate.activeScanId !== null) {
+      return {
+        available: false,
+        busy: true,
+        activeScanId: gate.activeScanId,
+        activeOperation: gate.activeOperation || 'Verifying clip',
+      }
+    }
+
+    if (gate.cooldownUntil > now) {
+      return {
+        available: false,
+        busy: true,
+        cooling: true,
+        waitSec: Math.ceil((gate.cooldownUntil - now) / 1000),
+      }
+    }
+
+    if (gate.nextFreeAt > now) {
+      return {
+        available: false,
+        busy: true,
+        waitSec: Math.ceil((gate.nextFreeAt - now) / 1000),
+      }
+    }
+
+    if (gate.waiters.length > 0) {
+      return {
+        available: false,
+        busy: true,
+        waitSec: 1,
+      }
+    }
+
+    return { available: true, busy: false }
+  }
+
+  /**
+   * Acquire lock for Verifier with Anti-Thundering-Herd FIFO queue and 3s pacing.
+   */
+  public async acquireVerifier(opts: {
+    scanId: string
+    scanTitle?: string
+    apiKey: string
+    keyIdx?: number
+    modelId: string
+    operation: string
+    videoSeconds?: number
+    rpd?: number
+    onWait?: (msg: string, waitSec: number) => void
+    isStopping?: () => boolean
+  }): Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void> {
+    const {
+      scanId,
+      scanTitle = scanId,
+      apiKey,
+      keyIdx = 1,
+      modelId,
+      operation,
+      rpd = 500,
+      onWait,
+      isStopping,
+    } = opts
+
+    this.checkDayRollover()
+    const gate = this.getOrCreateVerifierGate(apiKey, modelId, keyIdx)
+
+    return new Promise((resolve, reject) => {
+      const now = Date.now()
+      const isFree =
+        !gate.isExhausted &&
+        !isModelDailyQuotaExhausted(modelId, apiKey, rpd) &&
+        gate.activeScanId === null &&
+        gate.cooldownUntil <= now &&
+        gate.nextFreeAt <= now &&
+        gate.waiters.length === 0
+
+      if (isFree) {
+        // Grab lock atomically
+        gate.activeScanId = scanId
+        gate.activeScanTitle = scanTitle
+        gate.activeOperation = operation
+        gate.activeSince = now
+
+        const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+          this.releaseVerifier(gate, cooldownOverrideMs)
+        }
+        resolve(release)
+        return
+      }
+
+      const waitSec =
+        gate.cooldownUntil > now
+          ? Math.ceil((gate.cooldownUntil - now) / 1000)
+          : gate.nextFreeAt > now
+          ? Math.ceil((gate.nextFreeAt - now) / 1000)
+          : 2
+
+      const waitMsg = gate.activeScanId
+        ? `[Global Coordinator] Key ${gate.keyIdx} · ${modelId} verifier busy in Scan "${gate.activeScanTitle || gate.activeScanId}". Queued...`
+        : gate.cooldownUntil > now
+        ? `[Global Coordinator] Key ${gate.keyIdx} · ${modelId} verifier in 60s cooldown (${waitSec}s remaining). Queued...`
+        : `[Global Coordinator] Key ${gate.keyIdx} · ${modelId} verifier pacing delay (${waitSec}s remaining). Queued...`
+
+      onWait?.(waitMsg, waitSec)
+
+      gate.waiters.push({
+        id: Math.random().toString(36).substring(2, 9),
+        scanId,
+        scanTitle,
+        operation,
+        resolve,
+        reject,
+        isStopping,
+      })
+
+      const delayMs = Math.max(
+        100,
+        gate.cooldownUntil > now
+          ? gate.cooldownUntil - now + 50
+          : gate.nextFreeAt > now
+          ? gate.nextFreeAt - now + 50
+          : 500,
+      )
+      this.scheduleVerifierDispatch(gate, delayMs)
+    })
+  }
+
+  private scheduleVerifierDispatch(gate: VerifierGateState, delayMs: number) {
+    if (gate.dispatchTimer) {
+      clearTimeout(gate.dispatchTimer)
+      gate.dispatchTimer = null
+    }
+    gate.dispatchTimer = setTimeout(() => {
+      gate.dispatchTimer = null
+      this.dispatchNextVerifier(gate)
+    }, Math.max(10, delayMs))
+  }
+
+  /**
+   * ANTI-THUNDERING-HERD DISPATCHER (Verifier):
+   * When cooldown or pacing expires, pops and grants the lock to ONLY THE FIRST WAITER.
+   * All other parallel scans remain queued and wake up in single file with 3s pacing.
+   */
+  private dispatchNextVerifier(gate: VerifierGateState) {
+    const now = Date.now()
+    if (gate.activeScanId !== null) return
+
+    if (gate.cooldownUntil > now) {
+      this.scheduleVerifierDispatch(gate, gate.cooldownUntil - now + 50)
+      return
+    }
+
+    if (gate.nextFreeAt > now) {
+      this.scheduleVerifierDispatch(gate, gate.nextFreeAt - now + 50)
+      return
+    }
+
+    while (gate.waiters.length > 0) {
+      const next = gate.waiters.shift()!
+      if (next.isStopping && next.isStopping()) {
+        next.reject(new Error('Stop requested while queued in verifier coordinator'))
+        continue
+      }
+
+      // ATOMIC LOCK ACQUISITION:
+      gate.activeScanId = next.scanId
+      gate.activeScanTitle = next.scanTitle
+      gate.activeOperation = next.operation
+      gate.activeSince = Date.now()
+
+      const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+        this.releaseVerifier(gate, cooldownOverrideMs)
+      }
+
+      next.resolve(releaseFn)
+      return // ONLY ONE WAITER RESOLVED!
+    }
+  }
+
+  private releaseVerifier(gate: VerifierGateState, cooldownOverrideMs?: number) {
+    const now = Date.now()
+    gate.activeScanId = null
+    gate.activeScanTitle = null
+    gate.activeOperation = null
+    gate.activeSince = null
+
+    if (cooldownOverrideMs && cooldownOverrideMs > 0) {
+      gate.cooldownUntil = Math.max(gate.cooldownUntil, now + cooldownOverrideMs)
+      this.scheduleVerifierDispatch(gate, cooldownOverrideMs + 50)
+    } else {
+      // 3,000ms minimum pacing gap between verifier requests on this (key × model).
+      // Guarantees maximum ~15-20 RPM, completely collision-free!
+      gate.nextFreeAt = Math.max(gate.nextFreeAt, now + 3000)
+      this.scheduleVerifierDispatch(gate, 3050)
+    }
+  }
+
+  // =========================================================================
+  // UNIFIED ROUTER & BACKWARDS-COMPATIBLE API
+  // =========================================================================
+
+  /**
+   * Unified isLaneBusy: Routes to ChunkGate (videoSeconds >= 50) or VerifierGate (videoSeconds < 50)
+   */
+  public isLaneBusy(
+    apiKey: string,
+    modelId: string,
+    _slot: number = 0,
+    rpdCap: number = 500,
+    videoSeconds: number = 0,
+  ): {
     busy: boolean
     exhausted?: boolean
     activeScanId?: string
@@ -144,81 +648,31 @@ class GlobalGeminiCoordinator {
     waitSec?: number
     cooling?: boolean
   } {
-    this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
-    const now = Date.now()
-
-    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
-      lane.isExhausted = true
-      return {
-        busy: true,
-        exhausted: true,
-        activeOperation: 'Exhausted for today',
-      }
-    }
-
-    // Heavy chunk mapping (videoSeconds >= 50, ~190,000 tokens):
-    // Strict per-model serialization: exactly 1 chunk scan per (API key × Model)!
-    // Other models on this same API key have their own independent TPM and are NOT blocked.
     if (videoSeconds >= 50) {
-      const kmKey = this.getModelKey(apiKey, modelId)
-      const activeChunk = this.modelActiveChunkScan.get(kmKey)
-      if (activeChunk) {
-        return {
-          busy: true,
-          activeScanId: activeChunk.scanId,
-          activeOperation: `Chunk scan on ${activeChunk.modelId}`,
-        }
-      }
-
-      const modelCool = this.modelChunkCooldownUntil.get(kmKey) || 0
-      if (modelCool > now) {
-        return {
-          busy: true,
-          cooling: true,
-          waitSec: Math.ceil((modelCool - now) / 1000),
-        }
-      }
-    }
-
-    if (lane.activeScanId) {
+      const res = this.canAcquireChunk(apiKey, modelId, rpdCap)
       return {
-        busy: true,
-        activeScanId: lane.activeScanId,
-        activeScanTitle: lane.activeScanTitle || undefined,
-        activeOperation: lane.activeOperation || undefined,
+        busy: res.busy,
+        exhausted: res.exhausted,
+        cooling: res.cooling,
+        waitSec: res.waitSec,
+        activeScanId: res.activeScanId,
+        activeOperation: res.activeOperation,
       }
-    }
-
-    if (lane.cooldownUntil > now) {
+    } else {
+      const res = this.canAcquireVerifier(apiKey, modelId, rpdCap)
       return {
-        busy: true,
-        cooling: true,
-        waitSec: Math.ceil((lane.cooldownUntil - now) / 1000),
+        busy: res.busy,
+        exhausted: res.exhausted,
+        cooling: res.cooling,
+        waitSec: res.waitSec,
+        activeScanId: res.activeScanId,
+        activeOperation: res.activeOperation,
       }
     }
-
-    if (lane.nextFreeAt > now) {
-      return {
-        busy: true,
-        waitSec: Math.ceil((lane.nextFreeAt - now) / 1000),
-      }
-    }
-
-    return { busy: false }
   }
 
   /**
-   * ATOMIC LANE ACQUISITION:
-   * Checks if this (Key × Model × Slot) lane is currently 100% free across the entire application:
-   * - NOT exhausted
-   * - NOT active in any other scan or worker
-   * - NOT in 429 / post-request cooldown
-   * - NOT in TPM pacing delay
-   *
-   * If free: ATOMICALLY locks the lane immediately and returns the release function!
-   * If busy: returns null immediately with ZERO waiting and ZERO blocking!
-   * This ensures a worker never pulls a chunk or task until it actually holds the lane lock.
+   * Unified tryAcquireLane: Routes to tryAcquireChunk or tryAcquireVerifier
    */
   public tryAcquireLane(opts: {
     scanId: string
@@ -231,110 +685,35 @@ class GlobalGeminiCoordinator {
     videoSeconds?: number
     rpd?: number
   }): { release: (actualVideoSec?: number, cooldownOverrideMs?: number) => void } | null {
-    const {
-      scanId,
-      scanTitle = scanId,
-      apiKey,
-      keyIdx = 1,
-      modelId,
-      slot = 0,
-      operation,
-      videoSeconds = 60,
-      rpd = 500,
-    } = opts
-
-    this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
-    const now = Date.now()
-    const kmKey = this.getModelKey(apiKey, modelId)
-
-    // 1. Quota check
-    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpd)) {
-      lane.isExhausted = true
-      return null
-    }
-
-    // Heavy chunk mapping (videoSeconds >= 50):
-    // Exactly ONE chunk request (~190,000 tokens) may execute per (API key × Model) at any time,
-    // and must observe the 70s cooldown before the next chunk request on that model.
-    // Other models on this API key have their own independent TPM and remain completely free.
+    const videoSeconds = opts.videoSeconds ?? 60
     if (videoSeconds >= 50) {
-      const activeChunk = this.modelActiveChunkScan.get(kmKey)
-      if (activeChunk) {
-        return null // This model on this API key is already running a chunk scan!
+      return this.tryAcquireChunk({
+        scanId: opts.scanId,
+        scanTitle: opts.scanTitle,
+        apiKey: opts.apiKey,
+        keyIdx: opts.keyIdx,
+        modelId: opts.modelId,
+        operation: opts.operation,
+        rpd: opts.rpd,
+      })
+    } else {
+      const check = this.canAcquireVerifier(opts.apiKey, opts.modelId, opts.rpd ?? 500, opts.keyIdx ?? 1)
+      if (!check.available) return null
+      const gate = this.getOrCreateVerifierGate(opts.apiKey, opts.modelId, opts.keyIdx ?? 1)
+      gate.activeScanId = opts.scanId
+      gate.activeScanTitle = opts.scanTitle ?? opts.scanId
+      gate.activeOperation = opts.operation
+      gate.activeSince = Date.now()
+      return {
+        release: (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+          this.releaseVerifier(gate, cooldownOverrideMs)
+        },
       }
-
-      const modelCool = this.modelChunkCooldownUntil.get(kmKey) || 0
-      if (modelCool > now) {
-        return null // This model on this API key is still in 70s TPM cooldown
-      }
     }
-
-    // 2. Concurrency check: already in use by any scan?
-    if (lane.activeScanId !== null) {
-      return null
-    }
-
-    // 3. Cooldown check: is this model on this key currently in cooldown?
-    if (lane.cooldownUntil > now) {
-      return null
-    }
-
-    // 4. Pacing check: is this lane still in TPM pacing delay?
-    if (lane.nextFreeAt > now) {
-      return null
-    }
-
-    // LOCK IS FREE! Acquire atomically right now.
-    lane.activeScanId = scanId
-    lane.activeScanTitle = scanTitle
-    lane.activeOperation = operation
-    lane.activeSince = now
-
-    if (videoSeconds >= 50) {
-      this.modelActiveChunkScan.set(kmKey, { scanId, modelId })
-    }
-
-    const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
-      this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
-    }
-
-    return { release }
   }
 
   /**
-   * Check if an API key has any active lanes currently executing in another scan.
-   * Useful for load-balancing parallel scans so that each scan prefers idle keys.
-   */
-  public isKeyActiveInOtherScan(apiKey: string, currentScanId: string): boolean {
-    const hash = apiKeyHash(apiKey)
-    for (const lane of this.lanes.values()) {
-      if (lane.keyHash === hash && lane.activeScanId !== null && lane.activeScanId !== currentScanId) {
-        return true
-      }
-    }
-    return false
-  }
-
-  /**
-   * Reset all in-memory lane exhaustion and cooldown flags.
-   * Called when user manually resets daily counters via Settings.
-   */
-  public resetAllLanes(): void {
-    this.modelActiveChunkScan.clear()
-    this.modelChunkCooldownUntil.clear()
-    for (const lane of this.lanes.values()) {
-      lane.isExhausted = false
-      lane.cooldownUntil = 0
-      lane.nextFreeAt = 0
-    }
-    console.log('[Global Coordinator] All lane exhaustion and cooldown states reset.')
-  }
-
-  /**
-   * Acquire an exclusive lock on a (Key × Model × Slot) lane across ALL scans in the entire application.
-   * If another scan is using the lane or if the lane is in TPM pacing / 429 cooldown,
-   * this will wait and yield gracefully without triggering duplicate requests or 429 collisions.
+   * Unified acquireLane: Routes to acquireChunk or acquireVerifier
    */
   public async acquireLane(opts: {
     scanId: string
@@ -348,147 +727,39 @@ class GlobalGeminiCoordinator {
     rpd?: number
     onWait?: (msg: string, waitSec: number) => void
     isStopping?: () => boolean
-  }): Promise<(actualVideoSec?: number) => void> {
-    const {
-      scanId,
-      scanTitle = scanId,
-      apiKey,
-      keyIdx = 1,
-      modelId,
-      slot = 0,
-      operation,
-      videoSeconds = 60,
-      rpd = 500,
-      onWait,
-      isStopping,
-    } = opts
-
-    this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
-
-    // Pre-flight quota check: if daily quota is already exhausted, abort immediately without waiting or uploading!
-    if (this.isModelExhausted(apiKey, modelId, rpd)) {
-      lane.isExhausted = true
-      throw new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`)
+  }): Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void> {
+    const videoSeconds = opts.videoSeconds ?? 60
+    if (videoSeconds >= 50) {
+      return this.acquireChunk({
+        scanId: opts.scanId,
+        scanTitle: opts.scanTitle,
+        apiKey: opts.apiKey,
+        keyIdx: opts.keyIdx,
+        modelId: opts.modelId,
+        operation: opts.operation,
+        videoSeconds,
+        rpd: opts.rpd,
+        onWait: opts.onWait,
+        isStopping: opts.isStopping,
+      })
+    } else {
+      return this.acquireVerifier({
+        scanId: opts.scanId,
+        scanTitle: opts.scanTitle,
+        apiKey: opts.apiKey,
+        keyIdx: opts.keyIdx,
+        modelId: opts.modelId,
+        operation: opts.operation,
+        videoSeconds,
+        rpd: opts.rpd,
+        onWait: opts.onWait,
+        isStopping: opts.isStopping,
+      })
     }
-
-    return new Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void>((resolve, reject) => {
-      const tryAcquireOrQueue = async () => {
-        if (isStopping && isStopping()) {
-          reject(new Error('Stop requested — lane acquisition cancelled'))
-          return
-        }
-
-        if (this.isModelExhausted(apiKey, modelId, rpd)) {
-          lane.isExhausted = true
-          reject(new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`))
-          return
-        }
-
-        const now = Date.now()
-
-        // If lane is currently active in another scan OR there are earlier waiters queued
-        const hasOtherActive = lane.activeScanId !== null
-        const isQueuedBehindOthers = lane.waiters.length > 0 && lane.waiters[0]?.scanId !== scanId
-
-        if (hasOtherActive || isQueuedBehindOthers) {
-          const waitMsg = hasOtherActive
-            ? `[Global Coordinator] Key ${lane.keyIdx} · ${modelId} is busy in Scan "${lane.activeScanTitle || lane.activeScanId}" (${lane.activeOperation || 'working'}). Waiting for lane to become free...`
-            : `[Global Coordinator] Key ${lane.keyIdx} · ${modelId} is queued behind other scans. Waiting turn...`
-
-          onWait?.(waitMsg, 5)
-
-          lane.waiters.push({
-            scanId,
-            scanTitle,
-            operation,
-            resolve: (releaseFn) => resolve(releaseFn),
-            reject,
-            isStopping,
-          })
-          return
-        }
-
-        // Check 429 Cooldown
-        if (lane.cooldownUntil > now) {
-          const waitMs = lane.cooldownUntil - now
-          const waitSec = Math.ceil(waitMs / 1000)
-          onWait?.(
-            `[Global Coordinator] Key ${lane.keyIdx} · ${displayModelName(modelId)} is in 429 rate cooldown (${waitSec}s remaining). Waiting for rate limit reset...`,
-            waitSec,
-          )
-
-          setTimeout(() => {
-            if (isStopping && isStopping()) {
-              reject(new Error('Stop requested during cooldown'))
-              return
-            }
-            void this.processNext(lane)
-          }, waitMs + 50)
-
-          lane.waiters.push({
-            scanId,
-            scanTitle,
-            operation,
-            resolve: (releaseFn) => resolve(releaseFn),
-            reject,
-            isStopping,
-          })
-          return
-        }
-
-        // Check TPM pacing interval
-        if (lane.nextFreeAt > now) {
-          const waitMs = lane.nextFreeAt - now
-          const waitSec = Math.ceil(waitMs / 1000)
-          onWait?.(
-            `[Global Coordinator] Key ${lane.keyIdx} · ${modelId} pacing wait (${waitSec}s for TPM quota). Pacing request...`,
-            waitSec,
-          )
-
-          setTimeout(() => {
-            if (isStopping && isStopping()) {
-              reject(new Error('Stop requested during pacing wait'))
-              return
-            }
-            void this.processNext(lane)
-          }, waitMs + 20)
-
-          lane.waiters.push({
-            scanId,
-            scanTitle,
-            operation,
-            resolve: (releaseFn) => resolve(releaseFn),
-            reject,
-            isStopping,
-          })
-          return
-        }
-
-        // Lock is free! Acquire exclusively now.
-        lane.activeScanId = scanId
-        lane.activeScanTitle = scanTitle
-        lane.activeOperation = operation
-        lane.activeSince = Date.now()
-
-        const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
-          this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
-        }
-
-        resolve(releaseFn)
-      }
-
-      void tryAcquireOrQueue()
-    })
   }
 
   /**
    * Dynamically search across multiple candidate lanes (different API keys and/or models).
-   * 1. If any candidate lane is immediately free (not in use, not cooling, not pacing, not exhausted),
-   *    grab that free lane instantly with ZERO wait!
-   * 2. If all candidate lanes are busy, poll/re-evaluate EVERY 1 SECOND across ALL candidates.
-   *    As soon as ANY lane (e.g. Key 3 · 3.8, or Key 2 · 3.6) frees up first,
-   *    immediately shift to that newly freed lane and acquire it!
    */
   public async acquireFirstAvailableLane(opts: {
     scanId: string
@@ -523,11 +794,8 @@ class GlobalGeminiCoordinator {
         throw new Error('Stop requested — lane acquisition cancelled')
       }
 
-      const now = Date.now()
-
       this.checkDayRollover()
 
-      // 1. Filter out permanently exhausted / disabled lanes and persist exhausted state instantly
       const availableCandidates = candidates.filter((c) => {
         return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd || 500)
       })
@@ -536,8 +804,6 @@ class GlobalGeminiCoordinator {
         throw new Error('All candidate keys/models have reached their daily quota or are exhausted')
       }
 
-      // Sort candidates to prioritize same-key multi-model usage before switching keys:
-      // Group by keyIdx ascending, and test available models on the current key first
       const sortedCandidates = [...availableCandidates].sort((a, b) => {
         if (a.keyIdx !== b.keyIdx) return a.keyIdx - b.keyIdx
         const aUsage = getModelUsage(a.modelId, a.apiKey)
@@ -545,196 +811,82 @@ class GlobalGeminiCoordinator {
         return aUsage - bUsage
       })
 
-      // 2. Check for immediately FREE lanes (no active scan, no cooldown, no pacing wait, no waiters)
       for (const cand of sortedCandidates) {
-        const kmKey = this.getModelKey(cand.apiKey, cand.modelId)
         if (videoSeconds >= 50) {
-          if (this.modelActiveChunkScan.has(kmKey)) continue
-          if ((this.modelChunkCooldownUntil.get(kmKey) || 0) > now) continue
-        }
-
-        const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
-        const isFree =
-          lane.activeScanId === null &&
-          lane.cooldownUntil <= now &&
-          lane.nextFreeAt <= now &&
-          lane.waiters.length === 0
-
-        if (isFree) {
-          // Immediately grab this free lane!
-          lane.activeScanId = scanId
-          lane.activeScanTitle = scanTitle
-          lane.activeOperation = operation
-          lane.activeSince = Date.now()
-
-          if (videoSeconds >= 50) {
-            this.modelActiveChunkScan.set(kmKey, { scanId, modelId: cand.modelId })
+          const check = this.canAcquireChunk(cand.apiKey, cand.modelId, cand.rpd || 20, cand.keyIdx)
+          if (check.available) {
+            const gate = this.getOrCreateChunkGate(cand.apiKey, cand.modelId, cand.keyIdx)
+            gate.activeScanId = scanId
+            gate.activeScanTitle = scanTitle
+            gate.activeOperation = operation
+            gate.activeSince = Date.now()
+            return {
+              selected: cand,
+              release: (actualVideoSec?: number) => {
+                this.releaseChunk(gate, actualVideoSec ?? videoSeconds)
+              },
+            }
           }
-
-          const release = (actualVideoSec?: number) => {
-            this.releaseLane(lane, actualVideoSec ?? videoSeconds)
+        } else {
+          const check = this.canAcquireVerifier(cand.apiKey, cand.modelId, cand.rpd || 500, cand.keyIdx)
+          if (check.available) {
+            const gate = this.getOrCreateVerifierGate(cand.apiKey, cand.modelId, cand.keyIdx)
+            gate.activeScanId = scanId
+            gate.activeScanTitle = scanTitle
+            gate.activeOperation = operation
+            gate.activeSince = Date.now()
+            return {
+              selected: cand,
+              release: () => {
+                this.releaseVerifier(gate)
+              },
+            }
           }
-
-          return { selected: cand, release }
         }
       }
 
-      // 3. None are immediately free. Calculate estimated shortest wait time across all candidate lanes
-      const waits = sortedCandidates.map((c) => {
-        const lane = this.getOrCreateLane(c.apiKey, c.modelId, c.slot || 0, c.keyIdx)
-        const cdWait = Math.max(0, lane.cooldownUntil - now)
-        const paceWait = Math.max(0, lane.nextFreeAt - now)
-        const activeWait = lane.activeScanId ? 4000 : 0
-        const totalWait = Math.max(cdWait, paceWait, activeWait)
-        return { c, lane, totalWait }
-      })
-
-      waits.sort((a, b) => a.totalWait - b.totalWait)
-      const shortest = waits[0]
-      const waitSec = Math.max(1, Math.ceil(shortest.totalWait / 1000))
-
+      // If all busy, wait 1 second and re-check
       const candidateSummary = availableCandidates
         .map((c) => `Key ${c.keyIdx} (${c.modelId})`)
         .slice(0, 4)
         .join(', ')
 
-      const waitMsg = `[Global Coordinator] All candidate lanes busy (${candidateSummary}${availableCandidates.length > 4 ? '...' : ''}). Re-checking every 1s for the first available lane (next free ~${waitSec}s)...`
-
+      const waitMsg = `[Global Coordinator] All candidate lanes busy (${candidateSummary}). Re-checking in 1s...`
       if (waitMsg !== lastLoggedWaitMsg) {
         lastLoggedWaitMsg = waitMsg
-        onWait?.(waitMsg, waitSec, candidateSummary)
+        onWait?.(waitMsg, 1, candidateSummary)
       }
 
-      // 4. Sleep for 1 second (1000ms), then re-evaluate the whole pool immediately!
       await new Promise((r) => setTimeout(r, 1000))
     }
   }
 
-  private releaseLane(lane: GlobalLaneState, videoSeconds: number, cooldownOverrideMs?: number) {
-    const paceMs = cooldownOverrideMs !== undefined
-      ? cooldownOverrideMs
-      : (videoSeconds >= 50 ? CHUNK_COOLDOWN_MS : pacingIntervalMs(videoSeconds))
+  public recordSuccess(apiKey: string, modelId: string, _slot: number = 0) {
+    const kmKey = this.getModelKey(apiKey, modelId)
+    this.consecutiveErrors.set(kmKey, 0)
+  }
+
+  public reportRateLimit(
+    apiKey: string,
+    modelId: string,
+    cooldownMs: number = RATE_COOLDOWN_MS,
+    _slot: number = 0,
+  ) {
     const now = Date.now()
-    const kh = lane.keyHash
-    lane.lastCompletedAt = now
-    lane.nextFreeAt = now + paceMs
-    lane.cooldownUntil = Math.max(lane.cooldownUntil, now + paceMs)
-    lane.lastOperation = lane.activeOperation
-    lane.lastOperationVideoSec = videoSeconds
-    lane.activeScanId = null
-    lane.activeScanTitle = null
-    lane.activeOperation = null
-    lane.activeSince = null
+    const kmKey = this.getModelKey(apiKey, modelId)
+    const cg = this.chunkGates.get(kmKey)
+    const vg = this.verifierGates.get(kmKey)
 
-    // For chunk mappings (videoSeconds >= 50 or paceMs >= 50000), synchronize cooldown across ALL slots of this (key × model)
-    // and release model-level active chunk mapping so that the 70s TPM cooldown is strictly observed for this model.
-    // Other models on the same key have their own independent TPM and are completely unaffected.
-    const kmKey = `${kh}:${lane.modelId}`
-    if (paceMs >= 50000 || videoSeconds >= 50) {
-      this.modelActiveChunkScan.delete(kmKey)
-      if (paceMs > 0) {
-        this.modelChunkCooldownUntil.set(kmKey, now + paceMs)
-      }
-      for (const other of this.lanes.values()) {
-        if (other.keyHash === kh && other.modelId === lane.modelId) {
-          other.cooldownUntil = Math.max(other.cooldownUntil, now + paceMs)
-          other.nextFreeAt = Math.max(other.nextFreeAt, now + paceMs)
-        }
-      }
+    if (cg) {
+      cg.cooldownUntil = Math.max(cg.cooldownUntil, now + cooldownMs)
+      this.scheduleChunkDispatch(cg, cooldownMs + 50)
     }
-
-    // Process next waiter in queue after pacing expires (or schedule it)
-    if (lane.waiters.length > 0) {
-      setTimeout(() => {
-        void this.processNext(lane)
-      }, paceMs + 20)
+    if (vg) {
+      vg.cooldownUntil = Math.max(vg.cooldownUntil, now + cooldownMs)
+      this.scheduleVerifierDispatch(vg, cooldownMs + 50)
     }
   }
 
-  private async processNext(lane: GlobalLaneState) {
-    if (lane.activeScanId !== null) return // still busy
-
-    while (lane.waiters.length > 0) {
-      const next = lane.waiters.shift()
-      if (!next) break
-
-      if (next.isStopping && next.isStopping()) {
-        next.reject(new Error('Stop requested while queued'))
-        continue
-      }
-
-      const now = Date.now()
-      if (lane.cooldownUntil > now) {
-        // Still in cooldown, put back and wait
-        lane.waiters.unshift(next)
-        const waitMs = lane.cooldownUntil - now
-        setTimeout(() => {
-          void this.processNext(lane)
-        }, waitMs + 50)
-        return
-      }
-
-      if (lane.nextFreeAt > now) {
-        // Still in pacing interval, put back and wait
-        lane.waiters.unshift(next)
-        const waitMs = lane.nextFreeAt - now
-        setTimeout(() => {
-          void this.processNext(lane)
-        }, waitMs + 20)
-        return
-      }
-
-      // Lane is free to take
-      lane.activeScanId = next.scanId
-      lane.activeScanTitle = next.scanTitle
-      lane.activeOperation = next.operation
-      lane.activeSince = Date.now()
-
-      const releaseFn = (actualVideoSec?: number) => {
-        this.releaseLane(lane, actualVideoSec ?? 60)
-      }
-
-      next.resolve(releaseFn)
-      return
-    }
-  }
-
-  /** Record successful request on this lane — resets consecutive error counters */
-  public recordSuccess(apiKey: string, modelId: string, slot: number = 0) {
-    const kh = apiKeyHash(apiKey)
-    const specificLane = this.lanes.get(this.getLaneKey(apiKey, modelId, slot))
-    if (specificLane) specificLane.consecutiveQuotaErrors = 0
-    for (const lane of this.lanes.values()) {
-      if (lane.keyHash === kh && lane.modelId === modelId) {
-        lane.consecutiveQuotaErrors = 0
-      }
-    }
-  }
-
-  /** Report a 429 Rate Limit error on a lane across the entire app */
-  public reportRateLimit(apiKey: string, modelId: string, cooldownMs: number = RATE_COOLDOWN_MS, slot: number = 0) {
-    const kh = apiKeyHash(apiKey)
-    const now = Date.now()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
-    lane.cooldownUntil = Math.max(lane.cooldownUntil, now + cooldownMs)
-
-    // Cooldown only slots for THIS specific model on this API key.
-    // Each model has its own independent 250k TPM and 15 RPM quota!
-    for (const other of this.lanes.values()) {
-      if (other.keyHash === kh && other.modelId === modelId) {
-        other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)
-      }
-    }
-  }
-
-  /**
-   * Smart Quota/Rate Limit handler:
-   * 1. Never disable the entire API key! Only isolate this specific model on this key.
-   * 2. Do not immediately treat a temporary 429 / per-minute rate limit as permanent daily quota exhaustion.
-   * 3. Apply a 1m 10s cooldown (70s) on that model and allow other keys/models to proceed.
-   * 4. Only if actual usedToday >= rpdCap OR (isExplicitDailyMsg AND usedToday >= rpdCap - 2),
-   *    mark this model as daily exhausted for today.
-   */
   public handleQuotaOrRateError(
     apiKey: string,
     modelId: string,
@@ -748,69 +900,77 @@ class GlobalGeminiCoordinator {
     reason: string
   } {
     this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
-    if (keyIdx > 0) lane.keyIdx = keyIdx
     const used = getModelUsage(modelId, apiKey)
-    const kh = apiKeyHash(apiKey)
-    const kmKey = `${kh}:${modelId}`
+    const kmKey = this.getModelKey(apiKey, modelId)
 
-    // Clear active chunk mapping on this (key × model) and enforce 70s model-level cooldown.
-    // Other models on this same API key have their own independent TPM and proceed uninterrupted!
-    this.modelActiveChunkScan.delete(kmKey)
-    this.modelChunkCooldownUntil.set(kmKey, Date.now() + CHUNK_COOLDOWN_MS)
-
-    // True daily quota exhaustion ONLY if:
-    // 1. Recorded usage has reached or passed the daily cap (used >= rpdCap), OR
-    // 2. Google explicitly flagged a daily quota exhaustion AND usage is near cap (used >= Math.max(5, rpdCap - 2)).
-    // A temporary 429 / RESOURCE_EXHAUSTED / per-minute spike must NEVER exhaust a model if used < rpdCap!
     if (used >= rpdCap || (isExplicitDailyMsg && used >= Math.max(5, rpdCap - 2))) {
       this.reportExhausted(apiKey, modelId, slot, rpdCap)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx})`,
+        reason: `Daily quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${keyIdx})`,
       }
     }
 
-    lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
+    const errors = (this.consecutiveErrors.get(kmKey) || 0) + 1
+    this.consecutiveErrors.set(kmKey, errors)
 
-    // Temporary RPM / TPM rate limit spike:
-    // Enforce 70s cooldown across all slots for this (key × model) so all scans pause this lane and use other free lanes.
+    // Cooldown both chunk and verifier gates on this model:
     this.reportRateLimit(apiKey, modelId, CHUNK_COOLDOWN_MS, slot)
+
     return {
       action: 'cooldown',
       waitSec: Math.ceil(CHUNK_COOLDOWN_MS / 1000),
-      reason: `Temporary rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for 1m 10s`,
+      reason: `Temporary rate/quota spike on ${modelId} (Key ${keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for 1m 10s`,
     }
   }
 
-  /** Report that a model's daily quota has been exhausted across the entire app */
-  public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20) {
-    const kh = apiKeyHash(apiKey)
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
-    lane.isExhausted = true
+  public reportExhausted(apiKey: string, modelId: string, _slot: number = 0, rpdCap: number = 20) {
+    const kmKey = this.getModelKey(apiKey, modelId)
+    const cg = this.chunkGates.get(kmKey)
+    const vg = this.verifierGates.get(kmKey)
 
-    // Mark ALL slots for this model on this API key as exhausted!
-    for (const other of this.lanes.values()) {
-      if (other.keyHash === kh && other.modelId === modelId) {
-        other.isExhausted = true
-        // Reject all queued waiters on this exhausted lane immediately with an error so they don't wait forever!
-        while (other.waiters.length > 0) {
-          const waiter = other.waiters.shift()
-          if (waiter) {
-            waiter.reject(new Error(`[Global Coordinator] Key ${other.keyIdx} (${modelId}) daily quota (${rpdCap} RPD) exhausted`))
-          }
-        }
+    if (cg) {
+      cg.isExhausted = true
+      while (cg.waiters.length > 0) {
+        const w = cg.waiters.shift()
+        w?.reject(new Error(`[Global Coordinator] Model ${modelId} reached daily limit (${rpdCap} RPD)`))
       }
     }
 
-    // Persist to counters.json so subsequent workers/processes know this model is quota-capped today
+    if (vg) {
+      vg.isExhausted = true
+      while (vg.waiters.length > 0) {
+        const w = vg.waiters.shift()
+        w?.reject(new Error(`[Global Coordinator] Model ${modelId} reached daily limit (${rpdCap} RPD)`))
+      }
+    }
+
     try {
       setModelExhausted(modelId, apiKey, rpdCap)
     } catch {}
   }
 
-  /** Get snapshot summary of all active/busy lanes across the application */
+  public resetAllLanes(): void {
+    for (const cg of this.chunkGates.values()) {
+      cg.isExhausted = false
+      cg.cooldownUntil = 0
+      cg.activeScanId = null
+      if (cg.dispatchTimer) clearTimeout(cg.dispatchTimer)
+      cg.dispatchTimer = null
+    }
+    for (const vg of this.verifierGates.values()) {
+      vg.isExhausted = false
+      vg.cooldownUntil = 0
+      vg.nextFreeAt = 0
+      vg.activeScanId = null
+      if (vg.dispatchTimer) clearTimeout(vg.dispatchTimer)
+      vg.dispatchTimer = null
+    }
+    this.consecutiveErrors.clear()
+    console.log('[Global Coordinator] All chunk and verifier gates reset.')
+  }
+
   public getSnapshot(): Array<{
     laneKey: string
     keyIdx: number
@@ -823,21 +983,50 @@ class GlobalGeminiCoordinator {
     pacingWaitSec: number
   }> {
     const now = Date.now()
-    return Array.from(this.lanes.values()).map((l) => ({
-      laneKey: l.laneKey,
-      keyIdx: l.keyIdx,
-      modelId: l.modelId,
-      activeScanId: l.activeScanId,
-      activeScanTitle: l.activeScanTitle,
-      activeOperation: l.activeOperation,
-      waitingCount: l.waiters.length,
-      cooling: l.cooldownUntil > now,
-      pacingWaitSec: Math.max(0, Math.ceil((Math.max(l.nextFreeAt, l.cooldownUntil) - now) / 1000)),
-    }))
+    const out: Array<{
+      laneKey: string
+      keyIdx: number
+      modelId: string
+      activeScanId: string | null
+      activeScanTitle: string | null
+      activeOperation: string | null
+      waitingCount: number
+      cooling: boolean
+      pacingWaitSec: number
+    }> = []
+
+    for (const cg of this.chunkGates.values()) {
+      out.push({
+        laneKey: `${cg.kmKey}:chunk`,
+        keyIdx: cg.keyIdx,
+        modelId: cg.modelId,
+        activeScanId: cg.activeScanId,
+        activeScanTitle: cg.activeScanTitle,
+        activeOperation: cg.activeOperation,
+        waitingCount: cg.waiters.length,
+        cooling: cg.cooldownUntil > now,
+        pacingWaitSec: Math.max(0, Math.ceil((cg.cooldownUntil - now) / 1000)),
+      })
+    }
+
+    for (const vg of this.verifierGates.values()) {
+      out.push({
+        laneKey: `${vg.kmKey}:verifier`,
+        keyIdx: vg.keyIdx,
+        modelId: vg.modelId,
+        activeScanId: vg.activeScanId,
+        activeScanTitle: vg.activeScanTitle,
+        activeOperation: vg.activeOperation,
+        waitingCount: vg.waiters.length,
+        cooling: vg.cooldownUntil > now,
+        pacingWaitSec: Math.max(0, Math.ceil((Math.max(vg.nextFreeAt, vg.cooldownUntil) - now) / 1000)),
+      })
+    }
+
+    return out
   }
 }
 
-// Global Singleton instance shared across the entire Node.js server process
 const globalCoordinatorKey = Symbol.for('__global_gemini_coordinator__')
 const globalObj = globalThis as unknown as { [globalCoordinatorKey]?: GlobalGeminiCoordinator }
 

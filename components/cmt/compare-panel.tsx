@@ -143,6 +143,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const sceneStartTimeRef = useRef<number>(0)
   const lastProgressCheckRef = useRef<{ shortTime: number; movieTime: number; timestamp: number } | null>(null)
   const firstEndedRef = useRef<{ who: 'short' | 'movie'; timestamp: number } | null>(null)
+  const shortLockedRef = useRef(false)
+  const movieLockedRef = useRef(false)
+  const isTransitioningRef = useRef(false)
 
   const pair = pairs[Math.min(idx, Math.max(0, pairs.length - 1))]
   const pairShortStart = pair?.shortStart ?? 0
@@ -243,11 +246,15 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     const mv = movieRef.current
     if (!sv || !mv || !pair) return
 
+    shortLockedRef.current = false
+    movieLockedRef.current = false
+    isTransitioningRef.current = false
+
     // Re-align to start if either has reached the end or is out of bounds
-    if (sv.currentTime >= shortEnd - 0.05 || sv.currentTime < shortStart - 0.2) {
+    if (sv.currentTime >= shortEnd - 0.04 || sv.currentTime < shortStart - 0.2) {
       try { sv.currentTime = shortStart } catch {}
     }
-    if (mv.currentTime >= movieEnd - 0.05 || mv.currentTime < movieStart - 0.2) {
+    if (mv.currentTime >= movieEnd - 0.04 || mv.currentTime < movieStart - 0.2) {
       try { mv.currentTime = movieStart } catch {}
     }
 
@@ -282,6 +289,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     if (mv) mv.pause()
     setPlaying(false)
     pendingAutoPlayRef.current = false
+    isTransitioningRef.current = false
     firstEndedRef.current = null
   }, [])
 
@@ -299,6 +307,11 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     lastFingerprintRef.current = fingerprint
 
     isSeekingRef.current = true
+    isTransitioningRef.current = true
+    shortLockedRef.current = false
+    movieLockedRef.current = false
+    sceneStartTimeRef.current = 0
+
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current)
       animFrameRef.current = null
@@ -306,6 +319,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
 
     const sv = shortRef.current
     const mv = movieRef.current
+    if (sv) sv.pause()
+    if (mv) mv.pause()
+
     safeSeek(sv, shortStart)
     safeSeek(mv, movieStart)
     if (shortBarRef.current) shortBarRef.current.style.width = '0%'
@@ -316,15 +332,16 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     if (pendingAutoPlayRef.current && autoplayRef.current) {
       pendingAutoPlayRef.current = false
 
-      // Synchronization barrier: wait for both videos to decode their seeked frames (or max 280ms)
+      // Synchronization barrier: wait for both videos to decode their seeked frames
       let settled = false
       const proceed = () => {
         if (settled) return
         settled = true
+        isTransitioningRef.current = false
         startPlayback()
       }
 
-      const timer = setTimeout(proceed, 280)
+      const timer = setTimeout(proceed, 220)
 
       const checkReady = () => {
         const sReady = !sv || (!sv.seeking && sv.readyState >= 2)
@@ -349,6 +366,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         clearTimeout(timer)
       }
     } else {
+      isTransitioningRef.current = false
       setPlaying(false)
     }
     isSeekingRef.current = false
@@ -372,10 +390,11 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       const mv = movieRef.current
       const baseSpeed = playbackRateRef.current
 
-      let shortEnded = false
-      let movieEnded = false
+      let shortEnded = shortLockedRef.current
+      let movieEnded = movieLockedRef.current
 
-      if (sv) {
+      // SHORT VIDEO PROGRESS & HARD LOCK:
+      if (!shortEnded && sv) {
         const cur = sv.currentTime
         const rel = Math.max(0, cur - shortStart)
         const pct = Math.min(100, (rel / shortDur) * 100)
@@ -383,18 +402,29 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           shortBarRef.current.style.width = `${pct}%`
         }
 
-        if (cur >= shortEnd - 0.04) {
+        // HARD STOP / LOCK ON SHORT SIDE:
+        // As soon as short video reaches shortEnd, immediately hard-pause and lock it.
+        // It will NEVER play even 0.01s beyond shortEnd!
+        if (cur >= shortEnd - 0.02) {
           sv.pause()
           sv.currentTime = shortEnd
+          if (shortBarRef.current) shortBarRef.current.style.width = '100%'
+          shortLockedRef.current = true
           shortEnded = true
         } else if (cur < shortStart - 0.5 && !sv.seeking) {
           try { sv.currentTime = shortStart } catch {}
         }
-      } else {
-        shortEnded = true
+      } else if (sv && shortEnded) {
+        // Enforce hard clamp: Keep strictly paused at shortEnd
+        if (!sv.paused) sv.pause()
+        if (Math.abs(sv.currentTime - shortEnd) > 0.04) {
+          sv.currentTime = shortEnd
+        }
+        if (shortBarRef.current) shortBarRef.current.style.width = '100%'
       }
 
-      if (mv) {
+      // MOVIE VIDEO PROGRESS & HARD LOCK:
+      if (!movieEnded && mv) {
         const cur = mv.currentTime
         const rel = Math.max(0, cur - movieStart)
         const pct = Math.min(100, (rel / movieDur) * 100)
@@ -402,18 +432,28 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           movieBarRef.current.style.width = `${pct}%`
         }
 
-        if (cur >= movieEnd - 0.04) {
+        // HARD STOP / LOCK ON MOVIE SIDE:
+        // As soon as movie video reaches movieEnd, immediately hard-pause and lock it.
+        // It will NEVER play even 0.01s beyond movieEnd!
+        if (cur >= movieEnd - 0.02) {
           mv.pause()
           mv.currentTime = movieEnd
+          if (movieBarRef.current) movieBarRef.current.style.width = '100%'
+          movieLockedRef.current = true
           movieEnded = true
         } else if (cur < movieStart - 0.5 && !mv.seeking) {
           try { mv.currentTime = movieStart } catch {}
         }
-      } else {
-        movieEnded = true
+      } else if (mv && movieEnded) {
+        // Enforce hard clamp: Keep strictly paused at movieEnd
+        if (!mv.paused) mv.pause()
+        if (Math.abs(mv.currentTime - movieEnd) > 0.04) {
+          mv.currentTime = movieEnd
+        }
+        if (movieBarRef.current) movieBarRef.current.style.width = '100%'
       }
 
-      // Record when one video reaches the cut earlier than the other
+      // Record when one video reaches its end earlier than the other
       if (shortEnded && !movieEnded) {
         if (!firstEndedRef.current) {
           firstEndedRef.current = { who: 'short', timestamp: Date.now() }
@@ -424,7 +464,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         }
       }
 
-      // Micro-drift correction without choppy seeks (only when both actively playing)
+      // Micro-drift correction without choppy seeks (ONLY when both are actively playing)
       if (sv && mv && !sv.paused && !mv.paused && !shortEnded && !movieEnded && !sv.seeking && !mv.seeking) {
         const relShort = (sv.currentTime - shortStart) / shortDur
         const relMovie = (mv.currentTime - movieStart) / movieDur
@@ -442,17 +482,19 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         }
       }
 
-      // Robust clip completion detection:
-      // Prevents hang if one video stalls near boundary or finishes slightly sooner
+      // CLIP COMPLETION DETECTION:
+      // Both videos must reach their hard stops (e.g. short finished at 2.0s, movie finished at 2.3s).
+      // Or safety fallback if one video has finished and the other has stalled for > 1500ms.
       const firstEndedDuration = firstEndedRef.current ? Date.now() - firstEndedRef.current.timestamp : 0
-      const clipFinished =
-        (shortEnded && movieEnded) ||
-        (shortEnded && (mv ? mv.currentTime >= movieEnd - 0.15 || mv.paused || firstEndedDuration > 600 : true)) ||
-        (movieEnded && (sv ? sv.currentTime >= shortEnd - 0.15 || sv.paused || firstEndedDuration > 600 : true))
+      const bothEnded = shortEnded && movieEnded
+      const stallSafety = (shortEnded || movieEnded) && firstEndedDuration > 1500
 
-      if (clipFinished) {
+      if (bothEnded || stallSafety) {
         if (autoplayRef.current) {
+          isTransitioningRef.current = true
           pendingAutoPlayRef.current = true
+          sceneStartTimeRef.current = 0
+          firstEndedRef.current = null
           setIdx((cur) => (cur + 1) % pairs.length)
         } else {
           setPlaying(false)
@@ -474,11 +516,14 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     }
   }, [playing, pair, shortStart, shortEnd, movieStart, movieEnd, shortDur, movieDur, pairs.length])
 
-  // 1-Second Watchdog / Self-Healing Heartbeat ("refresh hota he har 1 sec me taki atke nhi")
-  // Automatically detects decoder stalls, frozen frames, or hanging playback and self-heals
+  // 1-Second Watchdog / Self-Healing Heartbeat
+  // Automatically detects decoder stalls or frozen frames without causing skips
   useEffect(() => {
     const watchdog = setInterval(() => {
       if (!playing && !autoplayRef.current) return
+      // Never interfere during active scene transition or seeking!
+      if (isTransitioningRef.current || isSeekingRef.current) return
+
       const sv = shortRef.current
       const mv = movieRef.current
       if (!sv || !mv || !pair) return
@@ -487,13 +532,25 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       const speed = playbackRateRef.current || 1
       const maxSceneDuration = Math.max(shortDur, movieDur) / speed
 
+      // If both videos are already locked at their ends, ensure autoplay proceeds
+      if (shortLockedRef.current && movieLockedRef.current) {
+        if (autoplayRef.current && !isTransitioningRef.current) {
+          isTransitioningRef.current = true
+          pendingAutoPlayRef.current = true
+          sceneStartTimeRef.current = 0
+          setIdx((cur) => (cur + 1) % pairs.length)
+        }
+        return
+      }
+
       // 1. Scene Max Duration Timeout Guard:
-      // If a scene runs longer than its video duration + 2.2 seconds, automatically advance!
       if (sceneStartTimeRef.current > 0) {
         const elapsedSec = (now - sceneStartTimeRef.current) / 1000
-        if (elapsedSec > maxSceneDuration + 2.2) {
+        if (elapsedSec > maxSceneDuration + 1.2) {
           if (autoplayRef.current) {
+            isTransitioningRef.current = true
             pendingAutoPlayRef.current = true
+            sceneStartTimeRef.current = 0
             setIdx((cur) => (cur + 1) % pairs.length)
             return
           } else {
@@ -507,23 +564,12 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       if (playing) {
         const curShort = sv.currentTime
         const curMovie = mv.currentTime
-        const shortNearEnd = curShort >= shortEnd - 0.15
-        const movieNearEnd = curMovie >= movieEnd - 0.15
 
-        // If both videos reached or passed near-end, advance
-        if (shortNearEnd && movieNearEnd) {
-          if (autoplayRef.current) {
-            pendingAutoPlayRef.current = true
-            setIdx((cur) => (cur + 1) % pairs.length)
-            return
-          }
-        }
-
-        // If either video was paused unexpectedly in mid-scene, kickstart it!
-        if (sv.paused && !shortNearEnd && !sv.seeking) {
+        // CRITICAL: NEVER kickstart a video that has already reached its hard end!
+        if (sv.paused && !shortLockedRef.current && curShort < shortEnd - 0.05 && !sv.seeking) {
           void sv.play().catch(() => {})
         }
-        if (mv.paused && !movieNearEnd && !mv.seeking) {
+        if (mv.paused && !movieLockedRef.current && curMovie < movieEnd - 0.05 && !mv.seeking) {
           void mv.play().catch(() => {})
         }
 
@@ -535,15 +581,17 @@ export function ComparePanel({ scan }: { scan: Scan }) {
 
           // If neither video moved by more than 0.03s in the last second while supposed to be playing
           if (svDelta < 0.03 && mvDelta < 0.03 && now - lastCheck.timestamp >= 1000) {
-            if (shortNearEnd || movieNearEnd) {
+            if (shortLockedRef.current || movieLockedRef.current || curShort >= shortEnd - 0.1 || curMovie >= movieEnd - 0.1) {
               if (autoplayRef.current) {
+                isTransitioningRef.current = true
                 pendingAutoPlayRef.current = true
+                sceneStartTimeRef.current = 0
                 setIdx((cur) => (cur + 1) % pairs.length)
                 return
               }
             } else {
-              void sv.play().catch(() => {})
-              void mv.play().catch(() => {})
+              if (!shortLockedRef.current) void sv.play().catch(() => {})
+              if (!movieLockedRef.current) void mv.play().catch(() => {})
             }
           }
         }

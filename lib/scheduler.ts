@@ -8,7 +8,6 @@ import {
   VERIFY_MODEL_POOL,
   RESCAN_MODEL_POOL,
   RESCAN_BACKUP_POOL,
-  isRescanModel,
   MAX_QUALITY_RETRIES,
   MODEL_MIN_INTERVAL_MS,
   RATE_COOLDOWN_MS,
@@ -1590,6 +1589,32 @@ class Scheduler {
         continue
       }
 
+      // GLOBAL COORDINATOR PRE-CHECK:
+      // Har samay check karein ki kisi doosre scan me already ye model busy to nahi hai,
+      // ya 429 cooldown me to nahi hai, ya 3s pacing delay me to nahi hai!
+      // Agar busy ya cooling hai to job.verifyQueue se candidate group bilkul MAT nikalo,
+      // taaki baaki free keys/models ke workers is group ko turant process kar sakein.
+      const vCheck = globalGeminiCoordinator.canAcquireVerifier(lane.apiKey, m.id, m.rpd || 500, lane.idx)
+      if (!vCheck.available) {
+        if (vCheck.exhausted) {
+          if (st.state !== 'exhausted') {
+            st.state = 'exhausted'
+            this.mark(job)
+          }
+          return
+        }
+        if (vCheck.cooling) {
+          st.state = 'cooling'
+          st.cooldownUntil = Date.now() + (vCheck.waitSec || 5) * 1000
+          this.mark(job)
+          await sleep(Math.min(2000, (vCheck.waitSec || 2) * 1000))
+        } else {
+          st.state = 'waiting'
+          await sleep(350)
+        }
+        continue
+      }
+
       const gi = job.verifyQueue.shift()
       if (gi === undefined) {
         // PIPELINE PARALLELISM: while the chunk phase is still running, verify
@@ -1797,6 +1822,7 @@ class Scheduler {
             slot,
             m.rpd || 500,
             e.kind === 'rpd',
+            lane.idx,
           )
           if (outcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey)
@@ -2043,26 +2069,45 @@ class Scheduler {
           const chunkUp = await uploadVideo(lane.ai, chunkFile)
           uploadedNames.push(chunkUp.name)
 
-          // RESCAN models: PRIMARY = gemini-3-flash-preview / gemini-3.5-flash.
-          // BACKUP = high-limit lite models (500 RPD each) — jab primaries ki
-          // daily limit khatam ho jaye to rescan lite pool par continue hota
-          // hai, kabhi rukta nahi. Use the worker's own model when it is a
-          // primary rescan model, otherwise pick primary first, then backup.
-          const primaryRm = isRescanModel(m.id) && !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)
-            ? m
-            : RESCAN_MODEL_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
-          const backupRm = primaryRm
-            ? null
-            : RESCAN_BACKUP_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
-          const rm = primaryRm || backupRm
-          if (!rm) {
+          // RESCAN models:
+          // Check available models in RESCAN_MODEL_POOL, then RESCAN_BACKUP_POOL.
+          // Smart Load Balancing across parallel scans:
+          // If a model is currently busy in another scan or cooling down on this key,
+          // prefer an immediately free alternative model on this key with independent TPM.
+          const availablePrimary = RESCAN_MODEL_POOL.filter((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
+          const availableBackup = RESCAN_BACKUP_POOL.filter((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
+
+          if (availablePrimary.length === 0 && availableBackup.length === 0) {
             throw new GeminiError(
               'other',
               `Rescan models (${[...RESCAN_MODEL_POOL, ...RESCAN_BACKUP_POOL].map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — group re-queued for another key`,
             )
           }
-          if (backupRm) {
-            addLog(scan, 'warn', `Rescan: primary models (${RESCAN_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — BACKUP model ${backupRm.id} (500 RPD) use ho raha hai`)
+
+          // 1. If any primary model is 100% idle right now, pick it
+          const freePrimary = availablePrimary.find((cand) => {
+            const status = globalGeminiCoordinator.isLaneBusy(lane.apiKey, cand.id, 0, cand.rpd || 500, 60)
+            return !status.busy
+          })
+
+          let rm: ModelSpec
+          let isBackup = false
+          if (freePrimary) {
+            rm = freePrimary
+          } else if (availablePrimary.length > 0) {
+            rm = availablePrimary[0]
+          } else {
+            // Primary exhausted, use backup pool
+            const freeBackup = availableBackup.find((cand) => {
+              const status = globalGeminiCoordinator.isLaneBusy(lane.apiKey, cand.id, 0, cand.rpd || 500, 60)
+              return !status.busy
+            })
+            rm = freeBackup || availableBackup[0]
+            isBackup = true
+          }
+
+          if (isBackup) {
+            addLog(scan, 'warn', `Rescan: primary models (${RESCAN_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — BACKUP model ${rm.id} (500 RPD) use ho raha hai`)
           }
 
           // CANDIDATE-FIRST HINT: chunk-mapping ne jo window claim ki thi, rescan
@@ -2096,10 +2141,11 @@ class Scheduler {
             slot,
           )
           const found = parseRescanMatch(raw)
+          c.rescanModel = rm.id
           if (!found) {
             c.rescan = 'not_found'
             this.mark(job)
-            addLog(scan, 'info', `Rescan of chunk ${c.chunkIndex}: NOT FOUND`)
+            addLog(scan, 'info', `Rescan of chunk ${c.chunkIndex}: NOT FOUND (model: ${rm.id})`)
             continue
           }
           c.rescan = 'found'

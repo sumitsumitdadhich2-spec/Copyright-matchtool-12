@@ -160,10 +160,11 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         isError = true
         errorCategory = 'prohibitedPolicy'
       } else if (
-        lower.includes('daily quota') ||
-        lower.includes('quota exhausted') ||
-        lower.includes('daily limit') ||
-        lower.includes('rpd')
+        lower.includes('daily quota limit reached') ||
+        lower.includes('model set aside today') ||
+        lower.includes('daily quota exhausted') ||
+        (lower.includes('daily limit reached') && !lower.includes('cooling down')) ||
+        (lower.includes('quota exhausted') && !lower.includes('cooling down') && !lower.includes('temporary'))
       ) {
         isError = true
         errorCategory = 'dailyExhausted'
@@ -182,6 +183,9 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         lower.includes('re-queued') ||
         lower.includes('overloaded') ||
         lower.includes('cooldown') ||
+        lower.includes('cooling down') ||
+        lower.includes('temporary rate/quota spike') ||
+        lower.includes('spike') ||
         lower.includes('api busy') ||
         lower.includes('failed on') ||
         (lower.includes('attempt') && lower.includes('failed'))
