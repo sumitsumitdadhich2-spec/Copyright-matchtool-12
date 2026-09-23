@@ -894,6 +894,7 @@ class GlobalGeminiCoordinator {
     rpdCap: number = 20,
     isExplicitDailyMsg: boolean = false,
     keyIdx: number = 1,
+    retryWaitSec?: number,
   ): {
     action: 'cooldown' | 'exhausted'
     waitSec: number
@@ -903,7 +904,10 @@ class GlobalGeminiCoordinator {
     const used = getModelUsage(modelId, apiKey)
     const kmKey = this.getModelKey(apiKey, modelId)
 
-    if (used >= rpdCap || (isExplicitDailyMsg && used >= Math.max(5, rpdCap - 2))) {
+    // ONLY mark permanently exhausted if actual usage genuinely reached rpdCap,
+    // or explicit daily request limit arrived AND usage is near cap (>= rpdCap - 1).
+    // Never mark exhausted at 1/20, 2/20, or 4/20 due to temporary token burst limits!
+    if (used >= rpdCap || (isExplicitDailyMsg && used >= Math.max(1, rpdCap - 1))) {
       this.reportExhausted(apiKey, modelId, slot, rpdCap)
       return {
         action: 'exhausted',
@@ -915,13 +919,18 @@ class GlobalGeminiCoordinator {
     const errors = (this.consecutiveErrors.get(kmKey) || 0) + 1
     this.consecutiveErrors.set(kmKey, errors)
 
-    // Cooldown both chunk and verifier gates on this model:
-    this.reportRateLimit(apiKey, modelId, CHUNK_COOLDOWN_MS, slot)
+    const effectiveCooldownMs = retryWaitSec && retryWaitSec > 0
+      ? (retryWaitSec * 1000) + 2000
+      : CHUNK_COOLDOWN_MS
 
+    // Cooldown both chunk and verifier gates on this model:
+    this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
+
+    const waitSec = Math.ceil(effectiveCooldownMs / 1000)
     return {
       action: 'cooldown',
-      waitSec: Math.ceil(CHUNK_COOLDOWN_MS / 1000),
-      reason: `Temporary rate/quota spike on ${modelId} (Key ${keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for 1m 10s`,
+      waitSec,
+      reason: `Temporary TPM rate limit on ${modelId} (Key ${keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for ${waitSec}s`,
     }
   }
 

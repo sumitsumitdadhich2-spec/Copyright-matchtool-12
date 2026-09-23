@@ -23,9 +23,11 @@ export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | '
 
 export class GeminiError extends Error {
   kind: GeminiErrorKind
-  constructor(kind: GeminiErrorKind, message: string) {
+  retryAfterSec?: number
+  constructor(kind: GeminiErrorKind, message: string, retryAfterSec?: number) {
     super(message)
     this.kind = kind
+    this.retryAfterSec = retryAfterSec
   }
 }
 
@@ -505,6 +507,18 @@ export async function deleteAllFilesOnKey(apiKey: string): Promise<{ deleted: nu
   }
 }
 
+export function parseRetryDelaySec(msg: string): number | undefined {
+  const match =
+    msg.match(/retry\s+(?:in|after)\s+([\d.]+)\s*s/i) ||
+    msg.match(/retrydelay["':\s]+([\d.]+)s/i) ||
+    msg.match(/([\d.]+)\s*s(?:econds)?\s*(?:remaining|cooldown|wait)/i)
+  if (match && match[1]) {
+    const s = parseFloat(match[1])
+    if (!isNaN(s) && s > 0 && s < 600) return Math.ceil(s)
+  }
+  return undefined
+}
+
 export function classifyError(err: unknown): GeminiError {
   if (err instanceof GeminiError) return err
   let msg = err instanceof Error ? err.message : String(err)
@@ -515,6 +529,7 @@ export function classifyError(err: unknown): GeminiError {
       msg = `${msg} (${causeMsg})`
     }
   }
+  const retryDelay = parseRetryDelaySec(msg)
   const lower = msg.toLowerCase()
   // Invalid or expired API Key — must disable the lane immediately and not count attempts against the item.
   if (
@@ -543,14 +558,14 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('overloaded') ||
     lower.includes('fetch failed')
   ) {
-    return new GeminiError('rate', msg)
+    return new GeminiError('rate', msg, retryDelay)
   }
 
-  // 1. Check if it's explicitly a TEMPORARY minute rate limit (TPM or RPM).
-  // Google Gemini API specifically names minute quotas with "_per_minute_" or "per minute":
+  // 1. Check if it's explicitly a TEMPORARY minute rate limit (TPM, RPM, or burst token limit).
+  // Google Gemini API names minute quotas with "_per_minute_", "per minute", "per_user", or token limit metrics:
   // e.g. "generate_content_tokens_per_model_per_minute_per_user" (TPM 250k)
   // or "generate_content_requests_per_model_per_minute_per_user" (RPM 15)
-  // or "Quota exceeded for quota metric 'GenerateContent requests per minute per user'"
+  // or "generate_content_tokens_per_model_per_user"
   const isMinuteRateLimit =
     lower.includes('per_minute') ||
     lower.includes('per minute') ||
@@ -558,10 +573,15 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('rpm') ||
     lower.includes('tpm') ||
     lower.includes('_per_minute_') ||
-    lower.includes('minute_per_user')
+    lower.includes('minute_per_user') ||
+    lower.includes('tokens_per_model_per_user') ||
+    lower.includes('tokens_per_user') ||
+    lower.includes('limit: 25000000') ||
+    lower.includes('limit: 50000000') ||
+    lower.includes('limit: 100000000')
 
-  // 2. Check if it's explicitly a DAILY quota exhaustion (RPD or 25M daily tokens).
-  // This must NEVER match minute-based rate limits!
+  // 2. Check if it's explicitly a DAILY request quota exhaustion (RPD).
+  // This must NEVER match minute-based or burst token rate limits!
   const isExplicitDaily =
     !isMinuteRateLimit &&
     (
@@ -569,21 +589,21 @@ export function classifyError(err: unknown): GeminiError {
       lower.includes('generatetokensperday') ||
       lower.includes('generate_requests_per_day') ||
       lower.includes('generate_content_requests_per_model_per_day') ||
-      lower.includes('generate_content_tokens_per_model_per_day') ||
       lower.includes('requests per day') ||
       lower.includes('request sper day') ||
       lower.includes('requests_per_day') ||
-      lower.includes('tokens per day') ||
-      lower.includes('tokens_per_day') ||
       lower.includes('_per_day_') ||
       lower.includes('daily requests') ||
-      (lower.includes('daily') && lower.includes('quota')) ||
-      (lower.includes('limit: 20') && lower.includes('daily')) ||
-      (lower.includes('limit: 25000000') || lower.includes('limit: 50000000') || lower.includes('limit: 100000000'))
+      (lower.includes('daily') && lower.includes('quota') && !lower.includes('token')) ||
+      (lower.includes('limit: 20') && lower.includes('daily'))
     )
 
   if (isExplicitDaily) {
     return new GeminiError('rpd', msg)
+  }
+
+  if (isMinuteRateLimit) {
+    return new GeminiError('rate', msg, retryDelay)
   }
 
   if (
@@ -616,7 +636,7 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('tpm')
 
   if (is429) {
-    return new GeminiError('rate', msg)
+    return new GeminiError('rate', msg, retryDelay)
   }
 
   if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder') || lower.includes('model'))) {

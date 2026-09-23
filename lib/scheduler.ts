@@ -868,8 +868,12 @@ class Scheduler {
    *  same 2 queue-head chunks (chunk 66 uploading on keys 1, 5, 3, 2, 6 at once). */
   private prefetchNextChunks(job: Job, lane: KeyLane) {
     if (job.stopping) return
-    // Pre-flight check: if this key has no models with quota remaining, skip prefetch
-    const hasActiveModel = CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd))
+    // Pre-flight check: if this key has no models with quota remaining or all models are currently cooling down, skip prefetch to prevent collisions
+    const hasActiveModel = CHUNK_MODEL_POOL.some((m) => {
+      const isExhausted = globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)
+      const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
+      return !isExhausted && cool <= Date.now()
+    })
     if (!hasActiveModel) return
 
     const PREFETCH_DEPTH = 2
@@ -1823,6 +1827,7 @@ class Scheduler {
             m.rpd || 500,
             e.kind === 'rpd',
             lane.idx,
+            e.retryAfterSec,
           )
           if (outcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey)
@@ -2767,6 +2772,7 @@ class Scheduler {
             m.rpd || 20,
             e.kind === 'rpd',
             lane.idx,
+            e.retryAfterSec,
           )
           if (quotaOutcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey)
@@ -2777,7 +2783,7 @@ class Scheduler {
             }
             addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
           } else {
-            job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + CHUNK_COOLDOWN_MS
+            job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + (quotaOutcome.waitSec * 1000 || CHUNK_COOLDOWN_MS)
             const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
