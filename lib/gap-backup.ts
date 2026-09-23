@@ -455,19 +455,26 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               }
               queue.push(item)
               log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — disabled for this scan; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for another key`)
-            } else if (e.kind === 'rpd') {
-              setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
-              lane.dead = true
-              queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily token/request quota exhausted — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+            } else if (e.kind === 'rpd' || e.kind === 'rate' || is503OrBusyError(err)) {
+              const used = getModelUsage(lane.model.id, lane.key)
+              if (used >= lane.model.rpd) {
+                setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
+                lane.dead = true
+                queue.push(item)
+                log(scan, 'error', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily request quota reached (${used}/${lane.model.rpd} RPD) — model lane removed; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+              } else {
+                lane.cooldownUntil = Date.now() + 30_000
+                queue.push(item)
+                log(
+                  scan,
+                  'error',
+                  `Missing-scene finder: [Gemini Quota / TPM Hit] Key ${lane.keyIndex + 1} · ${lane.model.id}: ${e.message.slice(0, 100)} — TPM hit! Waiting 30s cooldown before retry (Used: ${used}/${lane.model.rpd} RPD, quota remaining). Chunk ${chunkIndex + 1} re-queued`,
+                )
+              }
             } else if (e.kind === 'empty') {
               lane.cooldownUntil = Date.now() + 3_000
               queue.push(item)
               log(scan, 'warn', `Missing-scene finder: Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for alternative model`)
-            } else if (e.kind === 'rate' || is503OrBusyError(err)) {
-              lane.cooldownUntil = Date.now() + 5_000
-              queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Rate limit / High demand on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
             } else {
               queue.push(item)
               log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts}/7 failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)

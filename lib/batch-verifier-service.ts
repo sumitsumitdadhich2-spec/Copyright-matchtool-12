@@ -320,12 +320,24 @@ export async function verifySingleMinute(
             0,
             chosenLane.rpd || 500,
             geminiErr.kind === 'rpd',
+            chosenLane.keyIdx,
+            geminiErr.retryAfterSec,
+            geminiErr.message,
           )
-          logScan(
-            scanId,
-            'warn',
-            `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}): ${outcome.reason}`,
-          )
+          if (outcome.action === 'exhausted') {
+            logScan(
+              scanId,
+              'error',
+              `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}): ${outcome.reason}`,
+            )
+          } else {
+            logScan(
+              scanId,
+              'error',
+              `[Batch Verifier Quota / TPM Hit] Key ${chosenLane.keyIdx} (${chosenModel}): ${geminiErr.message.slice(0, 120)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Quota remaining).`,
+            )
+            await new Promise((r) => setTimeout(r, outcome.waitSec * 1000))
+          }
           continue
         }
 

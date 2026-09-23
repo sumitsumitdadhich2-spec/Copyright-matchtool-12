@@ -549,12 +549,24 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 0,
                 selected.rpd || 20,
                 re.kind === 'rpd',
+                selected.keyIdx,
+                re.retryAfterSec,
+                re.message,
               )
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: ${outcome.reason} (attempt ${chunkAttempt}/${maxChunkAttempts})`,
-              )
+              if (outcome.action === 'exhausted') {
+                addLog(
+                  scan,
+                  'error',
+                  `[Missing Scene Finder] Chunk ${chunkIdx + 1}: ${outcome.reason}`,
+                )
+              } else {
+                addLog(
+                  scan,
+                  'error',
+                  `[Missing Scene Finder Quota / TPM Hit] Key ${selected.keyIdx} · ${selected.modelId}: ${re.message.slice(0, 120)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Quota remaining).`,
+                )
+                await new Promise((r) => setTimeout(r, outcome.waitSec * 1000))
+              }
               continue
             }
 
@@ -732,12 +744,24 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 0,
                 selected.rpd || 20,
                 re.kind === 'rpd',
+                selected.keyIdx,
+                re.retryAfterSec,
+                re.message,
               )
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] ${winLabel}: ${outcome.reason} (attempt ${winAttempt}/${maxWinAttempts})`,
-              )
+              if (outcome.action === 'exhausted') {
+                addLog(
+                  scan,
+                  'error',
+                  `[Missing Scene Finder] ${winLabel}: ${outcome.reason}`,
+                )
+              } else {
+                addLog(
+                  scan,
+                  'error',
+                  `[Missing Scene Finder Quota / TPM Hit] Key ${selected.keyIdx} · ${selected.modelId}: ${re.message.slice(0, 120)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Quota remaining).`,
+                )
+                await new Promise((r) => setTimeout(r, outcome.waitSec * 1000))
+              }
               continue
             }
 

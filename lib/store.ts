@@ -182,10 +182,9 @@ export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap
   return usage >= rpdCap
 }
 
-export function getModelExhausted(model: string, apiKey: string): boolean {
+export function getModelExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
   checkDailyReset()
-  const counters = getCachedCounters()
-  return counters[exhaustedKey(model, apiKey)] === true
+  return isModelDailyQuotaExhausted(model, apiKey, rpdCap)
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
@@ -194,6 +193,7 @@ export function incrementModelUsage(model: string, apiKey: string): number {
   const key = counterKey(model, apiKey)
   const nextVal = ((typeof counters[key] === 'number' ? (counters[key] as number) : 0) || 0) + 1
   counters[key] = nextVal
+
   // prune keys from other days to keep the file small
   const today = todayKey()
   for (const k of Object.keys(counters)) {
@@ -216,13 +216,16 @@ export function decrementModelUsage(model: string, apiKey: string): number {
   return (counters[key] as number) || 0
 }
 
-export function setModelExhausted(model: string, apiKey: string) {
+export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20) {
   checkDailyReset()
-  const counters = getCachedCounters()
-  // Store explicit exhaustion flag so scheduler stops using it today,
-  // without faking artificial counts in counters[key]!
-  counters[exhaustedKey(model, apiKey)] = true
-  saveCounters(counters)
+  const usage = getModelUsage(model, apiKey)
+  // Quota in Settings is the final source of truth:
+  // Only mark as exhausted if usage has truly reached or exceeded the cap!
+  if (usage >= rpdCap) {
+    const counters = getCachedCounters()
+    counters[exhaustedKey(model, apiKey)] = true
+    saveCounters(counters)
+  }
 }
 
 export function clearModelExhausted(model: string, apiKey: string): void {

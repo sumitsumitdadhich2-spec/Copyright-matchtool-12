@@ -545,7 +545,7 @@ export function ApiKeyPanel() {
                     { id: 'gemini-3.1-flash-lite', name: '3.1 Flash-Lite', rpd: 500 },
                   ]).map((m) => {
                     const used = slot.usage?.[m.id] ?? 0
-                    const isExhausted = Boolean(slot.exhausted?.[m.id]) || used >= m.rpd
+                    const isExhausted = used >= m.rpd
                     const isNear = used >= m.rpd * 0.8 && !isExhausted
                     return (
                       <div
@@ -563,7 +563,6 @@ export function ApiKeyPanel() {
                         </span>
                         <span className="font-semibold text-[11px] shrink-0">
                           {used}/{m.rpd}
-                          {isExhausted && used < m.rpd && <span className="ml-1 text-[9px] font-normal opacity-85">(Exh)</span>}
                         </span>
                       </div>
                     )

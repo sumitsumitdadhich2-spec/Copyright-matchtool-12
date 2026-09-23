@@ -1668,23 +1668,37 @@ class Scheduler {
           job.verifyQueue.push(gi)
           addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — disabled for this scan; group ${g.id} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
-          // If paceAndSend caught this, it already invoked handleQuotaOrRateError.
-          // Only mark exhausted in the job UI if the coordinator confirmed actual exhaustion:
-          if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd || 500)) {
+          const used = getModelUsage(m.id, lane.apiKey)
+          const rpdCap = m.rpd || 500
+          if (used >= rpdCap) {
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'exhausted'
             }
             job.verifyQueue.push(gi)
-            addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}) reached daily quota (${m.rpd}/${m.rpd} RPD) — group ${g.id} re-queued for another key`)
+            addLog(scan, 'error', `Verifier: ${m.id} (key ${lane.idx}) daily quota reached (${used}/${rpdCap} RPD) — group ${g.id} re-queued for another key`)
           } else {
-            const coolUntil = Date.now() + RATE_COOLDOWN_MS
+            const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
+              lane.apiKey,
+              m.id,
+              0,
+              rpdCap,
+              e.kind === 'rpd',
+              lane.idx,
+              e.retryAfterSec,
+              e.message,
+            )
+            const coolUntil = Date.now() + (outcome.waitSec * 1000 || RATE_COOLDOWN_MS)
             job.cooldownUntil[this.rateKey(lane, m)] = coolUntil
             st.state = 'cooling'
             st.cooldownUntil = coolUntil
             job.verifyQueue.push(gi)
-            addLog(scan, 'warn', `Verifier: temporary rate limit on ${displayModelName(m.id)} (key ${lane.idx}) — group ${g.id} re-queued; cooling down for 1 min`)
+            addLog(
+              scan,
+              'error',
+              `[Verifier Quota / TPM Hit] ${displayModelName(m.id)} (key ${lane.idx}): ${e.message.slice(0, 140)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Used: ${used}/${rpdCap} RPD, quota remaining). Group ${g.id} re-queued.`,
+            )
           }
         } else {
           g.attempts += 1
@@ -1871,7 +1885,15 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
 
-        if (e.kind === 'rate' && m) {
+        if ((e.kind === 'rate' || e.kind === 'rpd') && m) {
+          const used = getModelUsage(m.id, lane.apiKey)
+          const rpdCap = m.rpd || 500
+          if (used >= rpdCap) {
+            st.state = 'exhausted'
+            this.mark(job)
+            throw err
+          }
+
           rateRetries++
           const rk = this.rateKey(lane, m)
           const pk = this.paceSlotKey(lane, m, slot)
@@ -1901,8 +1923,8 @@ class Scheduler {
 
           addLog(
             job.scan,
-            'warn',
-            `Verifier: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx}) — giving 1 min cooldown. Prepared clip is held ready; will send immediately when 1 min completes (attempt ${rateRetries}/${maxRateRetries}).`,
+            'error',
+            `[Verifier Quota / TPM Hit] ${displayModelName(m.id)} (key ${lane.idx}): ${e.message.slice(0, 140)} — TPM hit! Giving 1 min cooldown (Used: ${used}/${rpdCap} RPD, quota remaining). Prepared clip is held ready; will send immediately when 1 min completes (attempt ${rateRetries}/${maxRateRetries}).`,
           )
 
           const waitMs = coolUntil - Date.now()
@@ -2773,9 +2795,10 @@ class Scheduler {
             e.kind === 'rpd',
             lane.idx,
             e.retryAfterSec,
+            e.message,
           )
           if (quotaOutcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
+            setModelExhausted(m.id, lane.apiKey, m.rpd || 20)
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
@@ -2789,7 +2812,11 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'cooling'
             }
-            addLog(scan, 'error', `[Gemini TPM Hit] ${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
+            addLog(
+              scan,
+              'error',
+              `[Gemini Quota / TPM Hit] ${m.id} (key ${lane.idx}): ${e.message.slice(0, 140)} — TPM hit! Waiting ${quotaOutcome.waitSec}s cooldown before retry (Used: ${getModelUsage(m.id, lane.apiKey)}/${m.rpd || 20} RPD, quota remaining). Chunk ${chunkIndex} re-queued.`,
+            )
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

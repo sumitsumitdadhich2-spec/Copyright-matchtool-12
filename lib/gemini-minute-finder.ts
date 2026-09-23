@@ -1061,12 +1061,13 @@ async function laneWorker(
 
       // Daily cap reached during the run (shared counter with the chunk scan) —
       // retire this lane, hand the window back to the queue for another lane.
-      if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, lane.model.id, lane.model.rpd)) {
+      const laneUsed = getModelUsage(lane.model.id, lane.apiKey)
+      if (laneUsed >= lane.model.rpd) {
         lane.dead = true
         w.status = 'pending'
         queue.unshift(idx)
         persist(id, ctrl)
-        log(id, 'warn', `${lane.label}: daily cap (${lane.model.rpd} RPD) reached — lane retired, ${tag.toLowerCase()} #${w.index} re-queued`)
+        log(id, 'error', `${lane.label}: daily cap (${laneUsed}/${lane.model.rpd} RPD) reached — lane retired, ${tag.toLowerCase()} #${w.index} re-queued`)
         return
       }
 
@@ -1169,21 +1170,30 @@ async function laneWorker(
         w.status = 'pending'
         queue.push(idx)
         log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} disabled for this scan; ${tag.toLowerCase()} #${w.index} re-queued`)
-      } else if (e.kind === 'rpd') {
-        globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
-        setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
-        lane.dead = true
-        w.status = 'pending'
-        queue.push(idx)
-        log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
-      } else if (e.kind === 'rate') {
-        // 429 RPM/TPM: progressive cooldown (15s, 30s, 60s) on this specific model only
-        const coolMs = Math.min(60_000, 15_000 * Math.pow(2, (w.attempts || 1) - 1))
-        globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
-        ctrl.cooldownUntil[rk] = Date.now() + coolMs
-        w.status = 'pending'
-        queue.push(idx)
-        log(id, 'warn', `${tag} #${w.index}: 429/rate on ${lane.label} — ${Math.round(coolMs / 1000)}s cooldown (other models on Key ${lane.keyIdx} remain active), re-queued: ${e.message.slice(0, 120)}`)
+      } else if (e.kind === 'rpd' || e.kind === 'rate') {
+        const used = getModelUsage(lane.model.id, lane.apiKey)
+        const rpdCap = lane.model.rpd || 20
+        if (used >= rpdCap) {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, rpdCap)
+          setModelExhausted(lane.model.id, lane.apiKey, rpdCap)
+          lane.dead = true
+          w.status = 'pending'
+          queue.push(idx)
+          log(id, 'error', `Key ${lane.keyIdx} · ${lane.model.id}: daily quota limit reached (${used}/${rpdCap} RPD) — model lane retired; ${tag.toLowerCase()} #${w.index} re-queued`)
+        } else {
+          // Quota is remaining in Settings: treat as TPM rate limit hit, log in red, wait cooldown and retry!
+          const retrySec = e.retryAfterSec || Math.min(60, 15 * Math.pow(2, (w.attempts || 1) - 1))
+          const coolMs = retrySec * 1000
+          globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
+          ctrl.cooldownUntil[rk] = Date.now() + coolMs
+          w.status = 'pending'
+          queue.push(idx)
+          log(
+            id,
+            'error',
+            `[Gemini Quota / TPM Hit] Key ${lane.keyIdx} · ${lane.model.id}: ${e.message.slice(0, 120)} — TPM hit! Waiting ${Math.round(coolMs / 1000)}s cooldown before retry (Used: ${used}/${rpdCap} RPD, quota remaining). ${tag.toLowerCase()} #${w.index} re-queued`,
+          )
+        }
       } else if (isFileGoneError(e.message)) {
         w.status = 'pending'
         queue.push(idx)
