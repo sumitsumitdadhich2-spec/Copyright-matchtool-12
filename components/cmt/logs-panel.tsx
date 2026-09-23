@@ -109,6 +109,25 @@ const CATEGORIES: CategoryDef[] = [
 
 function getLogCategoryTag(msg: string | undefined, level: string | undefined) {
   const m = (msg || '').toLowerCase()
+  if (
+    m.includes('tpm hit') ||
+    m.includes('tpm') ||
+    m.includes('rate limit') ||
+    m.includes('resource_exhausted') ||
+    m.includes('resource exhausted') ||
+    (m.includes('quota') && (level === 'error' || level === 'warn'))
+  ) {
+    return {
+      label: 'TPM WAIT',
+      className: 'border-rose-500/50 bg-rose-500/20 text-rose-400 font-bold',
+    }
+  }
+  if (level === 'error') {
+    return {
+      label: 'ERROR',
+      className: 'border-rose-500/50 bg-rose-500/20 text-rose-400 font-bold',
+    }
+  }
   if (m.includes('[batch verifier]') || m.includes('batch verify') || m.includes('stitched')) {
     return {
       label: 'BATCH 24FPS',
@@ -131,12 +150,6 @@ function getLogCategoryTag(msg: string | undefined, level: string | undefined) {
     return {
       label: 'SCAN',
       className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
-    }
-  }
-  if (level === 'error') {
-    return {
-      label: 'ERROR',
-      className: 'border-destructive/40 bg-destructive/15 text-destructive',
     }
   }
   if (level === 'warn') {
@@ -458,7 +471,13 @@ export function LogsPanel({ scan }: { scan: Scan }) {
 
                 {/* Message Body with smart styling */}
                 <div className="flex-1 break-words text-foreground/90 leading-snug">
-                  {cleanMsg.includes('CONFIRMED') ? (
+                  {cleanMsg.toLowerCase().includes('tpm hit') ||
+                  cleanMsg.toLowerCase().includes('rate limit') ||
+                  (cleanMsg.toLowerCase().includes('quota') && (l.level === 'error' || l.level === 'warn')) ? (
+                    <span className="text-rose-400 font-bold bg-rose-950/40 border border-rose-500/30 px-1.5 py-0.5 rounded inline-block">
+                      {cleanMsg}
+                    </span>
+                  ) : cleanMsg.includes('CONFIRMED') ? (
                     <span>
                       {cleanMsg.split('CONFIRMED')[0]}
                       <span className="inline-block rounded bg-emerald-500/20 text-emerald-400 font-bold px-1 mx-0.5 border border-emerald-500/30">
@@ -477,7 +496,7 @@ export function LogsPanel({ scan }: { scan: Scan }) {
                   ) : cleanMsg.includes('SUCCESS') ? (
                     <span className="text-emerald-400 font-medium">{cleanMsg}</span>
                   ) : l.level === 'error' ? (
-                    <span className="text-destructive font-medium">{cleanMsg}</span>
+                    <span className="text-rose-400 font-bold">{cleanMsg}</span>
                   ) : l.level === 'warn' ? (
                     <span className="text-amber-400 font-medium">{cleanMsg}</span>
                   ) : (

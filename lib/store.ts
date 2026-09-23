@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import type { Scan, ScanSummary, LogEntry } from './types'
-import { MODEL_POOL } from './models'
+import { MODEL_POOL, getModelRpdCap } from './models'
 import { backupScan, deleteScanRemote } from './scan-store'
 import { DATA_DIR, SCANS_DIR, MEDIA_DIR, MAX_SCANS } from './paths'
 import { removeScanWork } from './work-dir'
@@ -104,6 +104,17 @@ function getCachedCounters(): CountersData {
   if (!cachedCounters || now - cachedCountersTimestamp > CACHE_TTL_MS) {
     ensureDirs()
     cachedCounters = readJSON<CountersData>(COUNTERS_FILE, {})
+    // Auto-clean any legacy or spurious exhaustion flags
+    let cleaned = false
+    for (const k of Object.keys(cachedCounters)) {
+      if (k.startsWith('_exh|')) {
+        delete cachedCounters[k]
+        cleaned = true
+      }
+    }
+    if (cleaned) {
+      writeJSON(COUNTERS_FILE, cachedCounters)
+    }
     cachedCountersTimestamp = now
   }
   return cachedCounters
@@ -174,15 +185,19 @@ export function getModelUsage(model: string, apiKey: string): number {
   return typeof val === 'number' ? val : 0
 }
 
-export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
+/**
+ * Quota shown in Settings is the absolute final source of truth:
+ * If usage < cap, quota is available. Request MUST be sent.
+ * Only if usage >= cap (actual successful requests made today equal/exceed the limit) is it exhausted.
+ */
+export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap?: number): boolean {
   checkDailyReset()
+  const cap = rpdCap ?? getModelRpdCap(model)
   const usage = getModelUsage(model, apiKey)
-  // Quota shown in Settings is the absolute final source of truth:
-  // If usage is below cap, quota is available. If usage >= cap, it is exhausted.
-  return usage >= rpdCap
+  return usage >= cap
 }
 
-export function getModelExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
+export function getModelExhausted(model: string, apiKey: string, rpdCap?: number): boolean {
   checkDailyReset()
   return isModelDailyQuotaExhausted(model, apiKey, rpdCap)
 }
@@ -216,12 +231,13 @@ export function decrementModelUsage(model: string, apiKey: string): number {
   return (counters[key] as number) || 0
 }
 
-export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20) {
+export function setModelExhausted(model: string, apiKey: string, rpdCap?: number) {
   checkDailyReset()
+  const cap = rpdCap ?? getModelRpdCap(model)
   const usage = getModelUsage(model, apiKey)
   // Quota in Settings is the final source of truth:
   // Only mark as exhausted if usage has truly reached or exceeded the cap!
-  if (usage >= rpdCap) {
+  if (usage >= cap) {
     const counters = getCachedCounters()
     counters[exhaustedKey(model, apiKey)] = true
     saveCounters(counters)
@@ -254,9 +270,9 @@ export function reconcileTodayCounters(): void {
   const today = todayKey()
   const counters = getCachedCounters()
 
-  // Clean all spurious exhaustion flags from previous days or unconfirmed states
+  // Clean all spurious exhaustion flags
   for (const k of Object.keys(counters)) {
-    if (k.startsWith('_exh|') && !k.includes(`|${today}|`)) {
+    if (k.startsWith('_exh|')) {
       delete counters[k]
     }
   }

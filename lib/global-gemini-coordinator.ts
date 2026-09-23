@@ -8,7 +8,7 @@ import {
   geminiUsageDay,
   checkDailyReset,
 } from './store'
-import { RATE_COOLDOWN_MS, CHUNK_COOLDOWN_MS } from './models'
+import { RATE_COOLDOWN_MS, CHUNK_COOLDOWN_MS, getModelRpdCap, displayModelName } from './models'
 
 export interface CandidateLane {
   apiKey: string
@@ -149,11 +149,13 @@ class GlobalGeminiCoordinator {
   /**
    * Instant, zero-wait quota check:
    * Verifies if a model on a given API key has exhausted its daily quota (RPD).
+   * Strictly respects the quota shown in Settings UI: if used < cap, request MUST be sent.
    */
-  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
+  public isModelExhausted(apiKey: string, modelId: string, rpdCap?: number): boolean {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelRpdCap(modelId)
     const kmKey = this.getModelKey(apiKey, modelId)
-    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, cap)
     const cg = this.chunkGates.get(kmKey)
     const vg = this.verifierGates.get(kmKey)
     if (cg) cg.isExhausted = exhaustedInStore
@@ -173,7 +175,7 @@ class GlobalGeminiCoordinator {
   public canAcquireChunk(
     apiKey: string,
     modelId: string,
-    rpdCap: number = 20,
+    rpdCap?: number,
     keyIdx: number = 1,
   ): {
     available: boolean
@@ -185,10 +187,11 @@ class GlobalGeminiCoordinator {
     activeOperation?: string
   } {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelRpdCap(modelId)
     const gate = this.getOrCreateChunkGate(apiKey, modelId, keyIdx)
     const now = Date.now()
 
-    const exhausted = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    const exhausted = isModelDailyQuotaExhausted(modelId, apiKey, cap)
     gate.isExhausted = exhausted
     if (exhausted) {
       return { available: false, busy: true, exhausted: true }
@@ -409,7 +412,7 @@ class GlobalGeminiCoordinator {
   public canAcquireVerifier(
     apiKey: string,
     modelId: string,
-    rpdCap: number = 500,
+    rpdCap?: number,
     keyIdx: number = 1,
   ): {
     available: boolean
@@ -421,10 +424,11 @@ class GlobalGeminiCoordinator {
     activeOperation?: string
   } {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelRpdCap(modelId)
     const gate = this.getOrCreateVerifierGate(apiKey, modelId, keyIdx)
     const now = Date.now()
 
-    const exhausted = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    const exhausted = isModelDailyQuotaExhausted(modelId, apiKey, cap)
     gate.isExhausted = exhausted
     if (exhausted) {
       return { available: false, busy: true, exhausted: true }
@@ -639,7 +643,7 @@ class GlobalGeminiCoordinator {
     apiKey: string,
     modelId: string,
     _slot: number = 0,
-    rpdCap: number = 500,
+    rpdCap?: number,
     videoSeconds: number = 0,
   ): {
     busy: boolean
@@ -650,8 +654,9 @@ class GlobalGeminiCoordinator {
     waitSec?: number
     cooling?: boolean
   } {
+    const cap = rpdCap ?? getModelRpdCap(modelId)
     if (videoSeconds >= 50) {
-      const res = this.canAcquireChunk(apiKey, modelId, rpdCap)
+      const res = this.canAcquireChunk(apiKey, modelId, cap)
       return {
         busy: res.busy,
         exhausted: res.exhausted,
@@ -661,7 +666,7 @@ class GlobalGeminiCoordinator {
         activeOperation: res.activeOperation,
       }
     } else {
-      const res = this.canAcquireVerifier(apiKey, modelId, rpdCap)
+      const res = this.canAcquireVerifier(apiKey, modelId, cap)
       return {
         busy: res.busy,
         exhausted: res.exhausted,
@@ -893,7 +898,7 @@ class GlobalGeminiCoordinator {
     apiKey: string,
     modelId: string,
     slot: number = 0,
-    rpdCap: number = 20,
+    rpdCap?: number,
     _isExplicitDailyMsg: boolean = false,
     keyIdx: number = 1,
     retryWaitSec?: number,
@@ -905,17 +910,18 @@ class GlobalGeminiCoordinator {
     isTpmWait: boolean
   } {
     this.checkDayRollover()
+    const cap = rpdCap ?? getModelRpdCap(modelId)
     const used = getModelUsage(modelId, apiKey)
     const kmKey = this.getModelKey(apiKey, modelId)
 
     // Quota in Settings is the absolute final source of truth:
-    // If used < rpdCap, quota is NOT exhausted! Treat any 429/Resource Exhausted as a temporary TPM rate limit.
-    if (used >= rpdCap) {
-      this.reportExhausted(apiKey, modelId, slot, rpdCap)
+    // If used < cap, quota is NOT exhausted! Treat any 429/Resource Exhausted as a temporary TPM rate limit.
+    if (used >= cap) {
+      this.reportExhausted(apiKey, modelId, slot, cap)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${keyIdx})`,
+        reason: `Daily quota limit reached (${used}/${cap} RPD) on ${displayModelName(modelId)} (Key ${keyIdx})`,
         isTpmWait: false,
       }
     }
@@ -925,7 +931,7 @@ class GlobalGeminiCoordinator {
 
     const effectiveCooldownMs = retryWaitSec && retryWaitSec > 0
       ? (retryWaitSec * 1000) + 2000
-      : (rpdCap <= 20 ? CHUNK_COOLDOWN_MS : RATE_COOLDOWN_MS)
+      : (cap <= 20 ? CHUNK_COOLDOWN_MS : RATE_COOLDOWN_MS)
 
     // Cooldown both chunk and verifier gates on this model:
     this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
@@ -935,16 +941,22 @@ class GlobalGeminiCoordinator {
     return {
       action: 'cooldown',
       waitSec,
-      reason: `TPM rate limit hit on ${modelId} (Key ${keyIdx}, used ${used}/${rpdCap} RPD — quota remaining: ${rpdCap - used})${errSnippet} — waiting ${waitSec}s cooldown before retry`,
+      reason: `TPM rate limit hit on ${displayModelName(modelId)} (Key ${keyIdx}, used ${used}/${cap} RPD — quota remaining: ${cap - used})${errSnippet} — waiting ${waitSec}s cooldown before retry`,
       isTpmWait: true,
     }
   }
 
-  public reportExhausted(apiKey: string, modelId: string, _slot: number = 0, rpdCap: number = 20) {
+  public reportExhausted(apiKey: string, modelId: string, _slot: number = 0, rpdCap?: number) {
+    const cap = rpdCap ?? getModelRpdCap(modelId)
     const used = getModelUsage(modelId, apiKey)
-    if (used < rpdCap) {
+    if (used < cap) {
       // Quota shown in Settings is the absolute final source of truth:
-      // If used < rpdCap, quota is remaining. Never mark exhausted!
+      // If used < cap, quota is remaining. Never mark exhausted!
+      const kmKey = this.getModelKey(apiKey, modelId)
+      const cg = this.chunkGates.get(kmKey)
+      const vg = this.verifierGates.get(kmKey)
+      if (cg) cg.isExhausted = false
+      if (vg) vg.isExhausted = false
       return
     }
     const kmKey = this.getModelKey(apiKey, modelId)
@@ -955,7 +967,7 @@ class GlobalGeminiCoordinator {
       cg.isExhausted = true
       while (cg.waiters.length > 0) {
         const w = cg.waiters.shift()
-        w?.reject(new Error(`[Global Coordinator] Model ${modelId} reached daily limit (${used}/${rpdCap} RPD)`))
+        w?.reject(new Error(`[Global Coordinator] Model ${displayModelName(modelId)} reached daily limit (${used}/${cap} RPD)`))
       }
     }
 
@@ -963,12 +975,12 @@ class GlobalGeminiCoordinator {
       vg.isExhausted = true
       while (vg.waiters.length > 0) {
         const w = vg.waiters.shift()
-        w?.reject(new Error(`[Global Coordinator] Model ${modelId} reached daily limit (${used}/${rpdCap} RPD)`))
+        w?.reject(new Error(`[Global Coordinator] Model ${displayModelName(modelId)} reached daily limit (${used}/${cap} RPD)`))
       }
     }
 
     try {
-      setModelExhausted(modelId, apiKey, rpdCap)
+      setModelExhausted(modelId, apiKey, cap)
     } catch {}
   }
 

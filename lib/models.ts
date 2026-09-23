@@ -93,6 +93,12 @@ export const MODEL_POOL: ModelSpec[] = [
   ...PADDED_VERIFY_MODEL_POOL,
 ].filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i)
 
+/** Returns the daily RPD cap for a given model id, matching Settings UI. */
+export function getModelRpdCap(modelId: string): number {
+  const m = MODEL_POOL.find((x) => x.id === modelId)
+  return m ? m.rpd : 20
+}
+
 /** Is this model one of the three locked chunk-map models? */
 export function isChunkModel(id: string): boolean {
   return CHUNK_MODEL_POOL.some((m) => m.id === id)
