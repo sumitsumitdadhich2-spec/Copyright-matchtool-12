@@ -511,12 +511,27 @@ export function parseRetryDelaySec(msg: string): number | undefined {
   const match =
     msg.match(/retry\s+(?:in|after)\s+([\d.]+)\s*s/i) ||
     msg.match(/retrydelay["':\s]+([\d.]+)s/i) ||
+    msg.match(/retrydelay["':\s]+(\d+)/i) ||
     msg.match(/([\d.]+)\s*s(?:econds)?\s*(?:remaining|cooldown|wait)/i)
   if (match && match[1]) {
     const s = parseFloat(match[1])
-    if (!isNaN(s) && s > 0 && s < 600) return Math.ceil(s)
+    if (!isNaN(s) && s > 0 && s < 3600) return Math.ceil(s)
   }
   return undefined
+}
+
+export function extractCleanErrorMessage(err: unknown): string {
+  if (!err) return 'Unknown error'
+  const raw = err instanceof Error ? err.message : String(err)
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed?.error?.message) {
+      const lines = String(parsed.error.message).split('\n').map((l: string) => l.trim()).filter(Boolean)
+      const specificLine = lines.find((l: string) => l.includes('Quota exceeded') || l.includes('retry in') || l.includes('limit:')) || lines[0]
+      return specificLine || parsed.error.message
+    }
+  } catch {}
+  return raw.length > 200 ? `${raw.slice(0, 200)}...` : raw
 }
 
 export function classifyError(err: unknown): GeminiError {
@@ -561,7 +576,13 @@ export function classifyError(err: unknown): GeminiError {
     return new GeminiError('rate', msg, retryDelay)
   }
 
-  // 1. Check if it's explicitly a TEMPORARY minute rate limit (TPM, RPM, or burst token limit).
+  // 1. If Gemini returned a retry delay (e.g. 10s, 3s, 39s, 58s):
+  // This is ALWAYS a temporary rate/TPM limit or pacing burst, NEVER daily quota exhaustion!
+  if (retryDelay !== undefined && retryDelay < 3600) {
+    return new GeminiError('rate', msg, retryDelay)
+  }
+
+  // 2. Check if it's explicitly a TEMPORARY minute rate limit (TPM, RPM, or burst token limit).
   // Google Gemini API names minute quotas with "_per_minute_", "per minute", "per_user", or token limit metrics:
   // e.g. "generate_content_tokens_per_model_per_minute_per_user" (TPM 250k)
   // or "generate_content_requests_per_model_per_minute_per_user" (RPM 15)
@@ -580,9 +601,9 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('limit: 50000000') ||
     lower.includes('limit: 100000000')
 
-  // 2. Check if it's explicitly a DAILY request quota exhaustion (RPD).
-  // This must NEVER match minute-based or burst token rate limits!
+  // 3. Check if it's explicitly a DAILY request quota exhaustion (RPD) with NO short retry delay.
   const isExplicitDaily =
+    retryDelay === undefined &&
     !isMinuteRateLimit &&
     (
       lower.includes('generaterequestsperday') ||

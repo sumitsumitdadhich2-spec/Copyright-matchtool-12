@@ -461,14 +461,18 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
                 setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
                 lane.dead = true
                 queue.push(item)
-                log(scan, 'error', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily request quota reached (${used}/${lane.model.rpd} RPD) — model lane removed; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
+                log(
+                  scan,
+                  'error',
+                  `[QUOTA EXHAUSTED] Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily request quota reached (${used}/${lane.model.rpd} RPD) — model lane removed; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`,
+                )
               } else {
                 lane.cooldownUntil = Date.now() + 30_000
                 queue.push(item)
                 log(
                   scan,
                   'error',
-                  `Missing-scene finder: [Gemini Quota / TPM Hit] Key ${lane.keyIndex + 1} · ${lane.model.id}: ${e.message.slice(0, 100)} — TPM hit! Waiting 30s cooldown before retry (Used: ${used}/${lane.model.rpd} RPD, quota remaining). Chunk ${chunkIndex + 1} re-queued`,
+                  `[TPM HIT] Missing-scene finder: Key ${lane.keyIndex + 1} · ${lane.model.id}: Rate limit / TPM hit hua he! Waiting 30s cooldown before retry (Used: ${used}/${lane.model.rpd} RPD — quota remaining). Chunk ${chunkIndex + 1} re-queued`,
                 )
               }
             } else if (e.kind === 'empty') {

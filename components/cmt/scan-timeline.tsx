@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import type { Scan, ChunkState, ShortSegmentStatus, ShortSegmentState } from '@/lib/types'
 import { fmtTime } from '@/lib/format'
-import { displayModelName } from '@/lib/models'
+import { displayModelName, getModelRpdCap } from '@/lib/models'
 import { Clock, Zap, CheckCircle2, Layers, ListFilter } from 'lucide-react'
 
 const STATUS_CLASS: Record<string, string> = {
@@ -186,8 +186,14 @@ function getWaitingExplanation({
     .map(([m, s]) => `${displayModelName(m)} (${Math.max(1, Math.round((s.cooldownUntil! - Date.now()) / 1000))}s cooldown)`)
 
   const exhaustedList = Object.entries(scan.modelStates || {})
-    .filter(([, s]) => s.state === 'exhausted')
-    .map(([m]) => displayModelName(m))
+    .filter(([m, s]) => {
+      if (s.state !== 'exhausted') return false
+      const modelId = m.split('@')[0]
+      const cap = getModelRpdCap(modelId)
+      if (typeof s.usedToday === 'number' && s.usedToday < cap) return false
+      return true
+    })
+    .map(([m]) => displayModelName(m.split('@')[0]))
 
   if (scanningCount > 0 || activeModelCount > 0) {
     const chunkNames = scanningChunks.map((c) => `#${c.index + 1}`).join(', ')

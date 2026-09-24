@@ -328,13 +328,13 @@ export async function verifySingleMinute(
             logScan(
               scanId,
               'error',
-              `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}): ${outcome.reason}`,
+              `[QUOTA EXHAUSTED] Key ${chosenLane.keyIdx} (${chosenModel}): ${outcome.reason}`,
             )
           } else {
             logScan(
               scanId,
               'error',
-              `[Batch Verifier Quota / TPM Hit] Key ${chosenLane.keyIdx} (${chosenModel}): ${geminiErr.message.slice(0, 120)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Quota remaining).`,
+              `[TPM HIT] Key ${chosenLane.keyIdx} (${chosenModel}): Rate limit / TPM hit hua he! Waiting ${outcome.waitSec}s cooldown before retry (Settings quota remaining).`,
             )
             await new Promise((r) => setTimeout(r, outcome.waitSec * 1000))
           }

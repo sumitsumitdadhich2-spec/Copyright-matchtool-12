@@ -15,11 +15,13 @@ import {
   Layers,
   X,
   Radio,
+  Hourglass,
+  ShieldAlert,
 } from 'lucide-react'
 import type { Scan, LogEntry } from '@/lib/types'
 import { EngineBadge } from './engine-badge'
 
-type LogCategory = 'all' | 'batch' | 'render' | 'rescan' | 'scan' | 'alerts'
+type LogCategory = 'all' | 'tpm' | 'quota' | 'scan' | 'batch' | 'render' | 'rescan' | 'alerts'
 
 interface CategoryDef {
   id: LogCategory
@@ -34,6 +36,43 @@ const CATEGORIES: CategoryDef[] = [
     label: 'All Logs',
     icon: Layers,
     countMatcher: () => true,
+  },
+  {
+    id: 'tpm',
+    label: 'TPM Hits',
+    icon: Hourglass,
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return msg.includes('[tpm hit]') || msg.includes('tpm hit') || msg.includes('tpm') || msg.includes('retry delay')
+    },
+  },
+  {
+    id: 'quota',
+    label: 'Quota Limits',
+    icon: ShieldAlert,
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        msg.includes('[quota exhausted]') ||
+        msg.includes('daily quota limit reached') ||
+        msg.includes('quota reached') ||
+        msg.includes('quota cap')
+      )
+    },
+  },
+  {
+    id: 'scan',
+    label: 'AI Scanner',
+    icon: Search,
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        msg.includes('chunk') ||
+        msg.includes('mapping short') ||
+        msg.includes('segment') ||
+        msg.includes('split')
+      )
+    },
   },
   {
     id: 'batch',
@@ -77,40 +116,35 @@ const CATEGORIES: CategoryDef[] = [
     },
   },
   {
-    id: 'scan',
-    label: 'AI Scanner',
-    icon: Search,
-    countMatcher: (l) => {
-      const msg = (l?.msg || '').toLowerCase()
-      return (
-        msg.includes('chunk') ||
-        msg.includes('mapping short') ||
-        msg.includes('segment') ||
-        msg.includes('split')
-      )
-    },
-  },
-  {
     id: 'alerts',
-    label: 'Alerts & Quota',
+    label: 'Alerts',
     icon: AlertTriangle,
     countMatcher: (l) => {
-      const msg = (l?.msg || '').toLowerCase()
-      return (
-        l?.level === 'warn' ||
-        l?.level === 'error' ||
-        msg.includes('quota') ||
-        msg.includes('exhausted') ||
-        msg.includes('rate limit')
-      )
+      return l?.level === 'warn' || l?.level === 'error'
     },
   },
 ]
 
 function getLogCategoryTag(msg: string | undefined, level: string | undefined) {
   const m = (msg || '').toLowerCase()
+  if (m.includes('[tpm hit]') || m.includes('tpm hit') || m.includes('tpm wait')) {
+    return {
+      label: 'TPM HIT',
+      className: 'border-rose-500/80 bg-rose-500/25 text-rose-300 font-bold tracking-wider',
+    }
+  }
   if (
-    m.includes('tpm hit') ||
+    m.includes('[quota exhausted]') ||
+    m.includes('daily quota limit reached') ||
+    m.includes('daily quota reached') ||
+    m.includes('quota cap')
+  ) {
+    return {
+      label: 'QUOTA EXHAUSTED',
+      className: 'border-red-600 bg-red-950/90 text-red-200 font-bold tracking-wider',
+    }
+  }
+  if (
     m.includes('tpm') ||
     m.includes('rate limit') ||
     m.includes('resource_exhausted') ||
@@ -471,8 +505,15 @@ export function LogsPanel({ scan }: { scan: Scan }) {
 
                 {/* Message Body with smart styling */}
                 <div className="flex-1 break-words text-foreground/90 leading-snug">
-                  {cleanMsg.toLowerCase().includes('tpm hit') ||
-                  cleanMsg.toLowerCase().includes('rate limit') ||
+                  {cleanMsg.includes('[TPM HIT]') || cleanMsg.toLowerCase().includes('tpm hit') ? (
+                    <span className="text-rose-300 font-bold bg-rose-950/60 border border-rose-500/50 px-2 py-0.5 rounded inline-block shadow-xs">
+                      {cleanMsg}
+                    </span>
+                  ) : cleanMsg.includes('[QUOTA EXHAUSTED]') || cleanMsg.toLowerCase().includes('daily quota limit reached') ? (
+                    <span className="text-red-200 font-bold bg-red-950/80 border border-red-700/60 px-2 py-0.5 rounded inline-block shadow-xs">
+                      {cleanMsg}
+                    </span>
+                  ) : cleanMsg.toLowerCase().includes('rate limit') ||
                   (cleanMsg.toLowerCase().includes('quota') && (l.level === 'error' || l.level === 'warn')) ? (
                     <span className="text-rose-400 font-bold bg-rose-950/40 border border-rose-500/30 px-1.5 py-0.5 rounded inline-block">
                       {cleanMsg}

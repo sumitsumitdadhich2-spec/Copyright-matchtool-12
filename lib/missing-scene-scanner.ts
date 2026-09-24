@@ -557,13 +557,15 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 addLog(
                   scan,
                   'error',
-                  `[Missing Scene Finder] Chunk ${chunkIdx + 1}: ${outcome.reason}`,
+                  `[QUOTA EXHAUSTED] Key ${selected.keyIdx} · ${selected.modelId}: ${outcome.reason}`,
                 )
               } else {
+                const used = getModelUsage(selected.modelId, selected.apiKey)
+                const cap = selected.rpd || 20
                 addLog(
                   scan,
                   'error',
-                  `[Missing Scene Finder Quota / TPM Hit] Key ${selected.keyIdx} · ${selected.modelId}: ${re.message.slice(0, 120)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Quota remaining).`,
+                  `[TPM HIT] Key ${selected.keyIdx} · ${selected.modelId}: Rate limit / TPM hit hua he! Cooldown ${outcome.waitSec}s wait kar rahe hain (Settings Quota: ${used}/${cap} RPD used — bacha hua hai). Cooldown ke baad retry hoga.`,
                 )
                 await new Promise((r) => setTimeout(r, outcome.waitSec * 1000))
               }
@@ -752,13 +754,13 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 addLog(
                   scan,
                   'error',
-                  `[Missing Scene Finder] ${winLabel}: ${outcome.reason}`,
+                  `[QUOTA EXHAUSTED] Key ${selected.keyIdx} · ${selected.modelId} (${winLabel}): ${outcome.reason}`,
                 )
               } else {
                 addLog(
                   scan,
                   'error',
-                  `[Missing Scene Finder Quota / TPM Hit] Key ${selected.keyIdx} · ${selected.modelId}: ${re.message.slice(0, 120)} — TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Quota remaining).`,
+                  `[TPM HIT] Key ${selected.keyIdx} · ${selected.modelId}: Rate limit / TPM hit! Waiting ${outcome.waitSec}s cooldown before retry (Settings quota remaining).`,
                 )
                 await new Promise((r) => setTimeout(r, outcome.waitSec * 1000))
               }

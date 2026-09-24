@@ -56,6 +56,7 @@ import {
   isSuspiciousChunkOutput,
   GeminiError,
   classifyError,
+  extractCleanErrorMessage,
 } from './gemini'
 import { applyGroupMatches, bestRejectedCandidate, groupMatchOrigin, originTag, sameShortSegment } from './candidate-pick'
 import { computeShortCoverage, coverageLine } from './short-coverage'
@@ -697,6 +698,10 @@ class Scheduler {
     }
     const s = job.scan.modelStates[key]
     s.usedToday = used
+    const cap = m.rpd || 20
+    if (s.state === 'exhausted' && used < cap) {
+      s.state = 'idle'
+    }
     return s
   }
 
@@ -1605,11 +1610,15 @@ class Scheduler {
       const vCheck = globalGeminiCoordinator.canAcquireVerifier(lane.apiKey, m.id, m.rpd || 500, lane.idx)
       if (!vCheck.available) {
         if (vCheck.exhausted) {
-          if (st.state !== 'exhausted') {
-            st.state = 'exhausted'
-            this.mark(job)
+          const usedNow = getModelUsage(m.id, lane.apiKey)
+          const rpdCapNow = m.rpd || 500
+          if (usedNow >= rpdCapNow) {
+            if (st.state !== 'exhausted') {
+              st.state = 'exhausted'
+              this.mark(job)
+            }
+            return
           }
-          return
         }
         if (vCheck.cooling) {
           st.state = 'cooling'
@@ -1893,6 +1902,7 @@ class Scheduler {
         if ((e.kind === 'rate' || e.kind === 'rpd') && m) {
           const used = getModelUsage(m.id, lane.apiKey)
           const rpdCap = m.rpd || 500
+          const st = this.modelState(job, lane, m)
           if (used >= rpdCap) {
             st.state = 'exhausted'
             this.mark(job)
@@ -1902,7 +1912,6 @@ class Scheduler {
           rateRetries++
           const rk = this.rateKey(lane, m)
           const pk = this.paceSlotKey(lane, m, slot)
-          const st = this.modelState(job, lane, m)
 
           if (rateRetries > maxRateRetries) {
             job.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS
@@ -2470,9 +2479,21 @@ class Scheduler {
         st.state = laneBusy.cooling ? 'cooling' : laneBusy.exhausted ? 'exhausted' : 'waiting'
         st.currentChunk = null
         if (laneBusy.exhausted) {
-          addLog(scan, 'warn', `${displayModelName(m.id)} (key ${lane.idx}) daily quota reached (${getModelUsage(m.id, lane.apiKey)}/${m.rpd} RPD) — removed from pool`)
-          this.mark(job)
-          return
+          const realUsed = getModelUsage(m.id, lane.apiKey)
+          const realCap = m.rpd || 20
+          if (realUsed >= realCap) {
+            addLog(
+              scan,
+              'warn',
+              `[QUOTA EXHAUSTED] ${displayModelName(m.id)} (key ${lane.idx}) daily quota reached (${realUsed}/${realCap} RPD) — removed from pool`,
+            )
+            this.mark(job)
+            return
+          } else {
+            // Coordinator flag was stale/spurious; quota still remains in Settings!
+            await sleep(1000)
+            continue
+          }
         }
         await sleep(laneBusy.cooling && laneBusy.waitSec ? Math.min(2000, laneBusy.waitSec * 1000) : 1000)
         continue
@@ -2483,7 +2504,22 @@ class Scheduler {
       if (chunkIndex === undefined) {
         // Queue is empty: release lock immediately with 0 cooldown so other scans can use this model
         acquired.release(0, 0)
-        if (job.inFlight.size === 0) {
+
+        // Safeguard: Check if there are still pending chunks in this segment that need scanning
+        const pendingChunks = (job.seg?.chunks || []).filter((c) => c.status === 'pending')
+        if (pendingChunks.length > 0) {
+          for (const pc of pendingChunks) {
+            if (!job.queue.includes(pc.index) && !job.inFlight.has(pc.index)) {
+              job.queue.push(pc.index)
+            }
+          }
+          if (job.queue.length > 0) {
+            await sleep(500)
+            continue
+          }
+        }
+
+        if (job.inFlight.size === 0 && pendingChunks.length === 0) {
           if (st.state !== 'idle') {
             st.state = 'idle'
             st.currentChunk = null
@@ -2746,11 +2782,21 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
 
-        // Always record error & diagnostic in chunk output so user can click 'AI output' and see what happened.
+        const used = getModelUsage(m.id, lane.apiKey)
+        const rpdCap = m.rpd || 20
+        const isTpm = e.kind === 'rate' || (e.retryAfterSec !== undefined && e.retryAfterSec < 3600)
+        const cleanErr = extractCleanErrorMessage(e)
+        const diagHeader = isTpm
+          ? `[TPM HIT - COOLDOWN WAIT]\nStatus: Temporary Rate/TPM Limit Hit (Burst Pacing)\nGemini Retry Delay: ${e.retryAfterSec || 15}s\nSettings Quota: ${used}/${rpdCap} RPD used (${Math.max(0, rpdCap - used)} bacha hai — NOT exhausted)\nAction: System waiting cooldown before auto-retry`
+          : used >= rpdCap
+          ? `[DAILY QUOTA EXHAUSTED]\nStatus: Daily Quota Completed (${used}/${rpdCap} RPD in Settings)\nAction: Model set aside for today`
+          : `[ERROR / DIAGNOSTIC]\nStatus: ${e.kind}`
+
+        // Always record clean error & diagnostic in chunk output so user can click 'AI output' and see what happened.
         this.recordChunkOutput(
           chunk,
           m.id,
-          `[ERROR / DIAGNOSTIC]\nModel: ${m.id} (Key ${lane.idx})\nError: ${e.message}\nTime: ${new Date().toISOString()}`,
+          `${diagHeader}\nModel: ${m.id} (Key ${lane.idx})\nDetails: ${cleanErr}\nTime: ${new Date().toISOString()}`,
         )
 
         // INFRASTRUCTURE / TRANSIENT ERROR CHECK:
@@ -2785,7 +2831,7 @@ class Scheduler {
           )
         } else if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
           chunk.status = 'failed'
-          addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped: ${e.message.slice(0, 140)}`)
+          addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped: ${cleanErr}`)
         } else if (e.kind === 'invalid_key') {
           const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
           if (laneState) {
@@ -2796,8 +2842,6 @@ class Scheduler {
           job.queue.push(chunkIndex)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
-          const used = getModelUsage(m.id, lane.apiKey)
-          const rpdCap = m.rpd || 20
           if (used >= rpdCap) {
             globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, rpdCap)
             setModelExhausted(m.id, lane.apiKey, rpdCap)
@@ -2806,7 +2850,11 @@ class Scheduler {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'exhausted'
             }
-            addLog(scan, 'error', `${displayModelName(m.id)} (key ${lane.idx}): Daily quota limit reached (${used}/${rpdCap} RPD). Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
+            addLog(
+              scan,
+              'error',
+              `[QUOTA EXHAUSTED] Key ${lane.idx} · ${displayModelName(m.id)}: Daily quota limit reached (${used}/${rpdCap} RPD Settings me complete ho gaya). Model lane set aside today. Chunk ${chunkIndex} re-queued for another key.`,
+            )
           } else {
             // Quota is remaining in Settings: NEVER set aside today! Treat as TPM rate limit hit, wait cooldown & retry!
             const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
@@ -2832,7 +2880,7 @@ class Scheduler {
             addLog(
               scan,
               'error',
-              `[Gemini Quota / TPM Hit] Key ${lane.idx} · ${displayModelName(m.id)}: ${e.message.slice(0, 140)} — TPM hit hua he! Cooldown ${quotaOutcome.waitSec}s wait kar rahe hain (Daily Quota remaining: ${used}/${rpdCap} RPD bacha hua hai). Chunk ${chunkIndex} re-queued; wait karo...`,
+              `[TPM HIT] Key ${lane.idx} · ${displayModelName(m.id)}: Rate limit / TPM hit hua he! Gemini retry delay: ${quotaOutcome.waitSec}s. Settings quota abhi bacha hua he (${used}/${rpdCap} RPD used — ${Math.max(0, rpdCap - used)} bacha hai). Model pool me active hai; ${quotaOutcome.waitSec}s wait karke Chunk ${chunkIndex} auto-retry hoga.`,
             )
           }
           chunk.status = 'pending'

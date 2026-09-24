@@ -537,9 +537,9 @@ export function ApiKeyPanel() {
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 font-mono">
                   {(data?.models ?? [
-                    { id: 'gemini-2.5-flash', name: '2.5 Flash', rpd: 20 },
-                    { id: 'gemini-2.5-pro', name: '2.5 Pro', rpd: 20 },
-                    { id: 'gemini-3-flash', name: '3 Flash', rpd: 20 },
+                    { id: 'gemini-3.6-flash', name: '3.6 Flash', rpd: 20 },
+                    { id: 'gemini-3.7-flash', name: '3.7 Flash', rpd: 20 },
+                    { id: 'gemini-3.8-flash', name: '3.8 Flash', rpd: 20 },
                     { id: 'gemini-3.5-flash', name: '3.5 Flash', rpd: 20 },
                     { id: 'gemini-3.5-flash-lite', name: '3.5 Flash-Lite', rpd: 500 },
                     { id: 'gemini-3.1-flash-lite', name: '3.1 Flash-Lite', rpd: 500 },

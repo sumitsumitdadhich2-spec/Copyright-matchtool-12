@@ -1179,9 +1179,13 @@ async function laneWorker(
           lane.dead = true
           w.status = 'pending'
           queue.push(idx)
-          log(id, 'error', `Key ${lane.keyIdx} · ${lane.model.id}: daily quota limit reached (${used}/${rpdCap} RPD) — model lane retired; ${tag.toLowerCase()} #${w.index} re-queued`)
+          log(
+            id,
+            'error',
+            `[QUOTA EXHAUSTED] Key ${lane.keyIdx} · ${lane.model.id}: Daily quota limit reached (${used}/${rpdCap} RPD Settings me complete ho gaya) — model lane retired for today; ${tag.toLowerCase()} #${w.index} re-queued`,
+          )
         } else {
-          // Quota is remaining in Settings: treat as TPM rate limit hit, log in red, wait cooldown and retry!
+          // Quota is remaining in Settings: treat as TPM rate limit hit, wait cooldown and retry!
           const retrySec = e.retryAfterSec || Math.min(60, 15 * Math.pow(2, (w.attempts || 1) - 1))
           const coolMs = retrySec * 1000
           globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
@@ -1191,7 +1195,7 @@ async function laneWorker(
           log(
             id,
             'error',
-            `[Gemini Quota / TPM Hit] Key ${lane.keyIdx} · ${lane.model.id}: ${e.message.slice(0, 120)} — TPM hit! Waiting ${Math.round(coolMs / 1000)}s cooldown before retry (Used: ${used}/${rpdCap} RPD, quota remaining). ${tag.toLowerCase()} #${w.index} re-queued`,
+            `[TPM HIT] Key ${lane.keyIdx} · ${lane.model.id}: Rate limit / TPM hit hua he! Gemini retry delay: ${Math.round(coolMs / 1000)}s. Settings quota abhi bacha hua he (${used}/${rpdCap} RPD used — ${Math.max(0, rpdCap - used)} bacha hai). Model active hai; cooldown ke baad ${tag.toLowerCase()} #${w.index} auto-retry hoga.`,
           )
         }
       } else if (isFileGoneError(e.message)) {
